@@ -26,12 +26,14 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.launch
 import org.apache.logging.log4j.LogManager
+import org.opensearch.action.admin.cluster.node.info.NodesInfoRequest
+import org.opensearch.action.admin.cluster.node.info.NodesInfoResponse
 import org.opensearch.core.action.ActionListener
 import org.opensearch.action.admin.indices.settings.get.GetSettingsRequest
 import org.opensearch.action.support.ActionFilters
 import org.opensearch.action.support.HandledTransportAction
 import org.opensearch.action.support.IndicesOptions
-import org.opensearch.client.Client
+import org.opensearch.transport.client.Client
 import org.opensearch.cluster.ClusterState
 import org.opensearch.cluster.metadata.MetadataCreateIndexService
 import org.opensearch.common.inject.Inject
@@ -101,8 +103,9 @@ class TransportReplicateIndexAction @Inject constructor(transportService: Transp
                 if (!leaderSettings.getAsBoolean(IndexSettings.INDEX_SOFT_DELETES_SETTING.key, false)) {
                     throw IllegalArgumentException("Cannot Replicate an index where the setting ${IndexSettings.INDEX_SOFT_DELETES_SETTING.key} is disabled")
                 }
-                //Not starting replication if leader index is knn as knn plugin is not installed on follower.
-                ValidationUtil.checkKNNEligibility(leaderSettings, clusterService, request.leaderIndex)
+
+                // Disabling knn checks as new api call will require us add roles in security index which will be a breaking call.
+//                ValidationUtil.checkKNNEligibility(getNodesInfoForPlugin(request.leaderAlias), request.leaderIndex)
 
                 ValidationUtil.validateIndexSettings(
                     environment,
@@ -135,6 +138,14 @@ class TransportReplicateIndexAction @Inject constructor(transportService: Transp
                 .request()
         return remoteClusterClient.suspending(remoteClusterClient.admin().cluster()::state,
                 injectSecurityContext = true, defaultContext = true)(clusterStateRequest).state
+    }
+
+    private suspend fun getNodesInfoForPlugin(leaderAlias: String): NodesInfoResponse {
+        val remoteClient = client.getRemoteClusterClient(leaderAlias)
+        var nodesInfoRequest = NodesInfoRequest().addMetric(NodesInfoRequest.Metric.PLUGINS.metricName())
+        return remoteClient.suspending(
+            remoteClient.admin().cluster()::nodesInfo
+        )(nodesInfoRequest)
     }
 
     private suspend fun getLeaderIndexSettings(leaderAlias: String, leaderIndex: String): Settings {
