@@ -281,6 +281,7 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
                 mdBuilder.put(newIndexMetadata)
             }
             newState.metadata(mdBuilder)
+            
             return newState.build()
         }
 
