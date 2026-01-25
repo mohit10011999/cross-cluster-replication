@@ -24,11 +24,13 @@ import org.opensearch.replication.metadata.UpdateMetadataAction
 import org.opensearch.replication.metadata.UpdateMetadataRequest
 import org.opensearch.replication.metadata.state.REPLICATION_LAST_KNOWN_OVERALL_STATE
 import org.opensearch.replication.metadata.state.getReplicationStateParamsForIndex
-import org.opensearch.replication.seqno.RemoteClusterRetentionLeaseHelper
+import org.opensearch.replication.task.cleanup.TaskCleanupManager
+import org.opensearch.replication.task.cleanup.StaleArtifactDetector
 import org.opensearch.replication.util.coroutineContext
 import org.opensearch.replication.util.suspendExecute
 import org.opensearch.replication.util.suspending
 import org.opensearch.replication.util.waitForClusterStateUpdate
+import org.opensearch.replication.util.stackTraceToString
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
@@ -55,9 +57,7 @@ import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.inject.Inject
 import org.opensearch.core.common.io.stream.StreamInput
 import org.opensearch.common.settings.Settings
-import org.opensearch.replication.util.stackTraceToString
-import org.opensearch.persistent.PersistentTasksCustomMetadata
-import org.opensearch.persistent.RemovePersistentTaskAction
+import org.opensearch.persistent.PersistentTasksService
 import org.opensearch.threadpool.ThreadPool
 import org.opensearch.transport.TransportService
 import java.io.IOException
@@ -78,7 +78,8 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
                                                               indexNameExpressionResolver:
                                                               IndexNameExpressionResolver,
                                                               val client: Client,
-                                                              val replicationMetadataManager: ReplicationMetadataManager) :
+                                                              val replicationMetadataManager: ReplicationMetadataManager,
+                                                              val persistentTasksService: PersistentTasksService) :
     TransportClusterManagerNodeAction<StopIndexReplicationRequest, AcknowledgedResponse> (STOP_REPLICATION_ACTION_NAME,
             transportService, clusterService, threadPool, actionFilters, ::StopIndexReplicationRequest,
             indexNameExpressionResolver), CoroutineScope by GlobalScope {
@@ -86,6 +87,12 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
     companion object {
         private val log = LogManager.getLogger(TransportStopIndexReplicationAction::class.java)
     }
+
+    private val staleArtifactDetector = StaleArtifactDetector(clusterService)
+
+    private val taskCleanupManager = TaskCleanupManager(
+        persistentTasksService, clusterService, client, replicationMetadataManager, staleArtifactDetector
+    )
 
     override fun checkBlock(request: StopIndexReplicationRequest, state: ClusterState): ClusterBlockException? {
         return state.blocks().globalBlockedException(ClusterBlockLevel.METADATA_WRITE)
@@ -96,122 +103,150 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
                                  listener: ActionListener<AcknowledgedResponse>) {
         launch(Dispatchers.Unconfined + threadPool.coroutineContext()) {
             try {
-                log.info("Stopping index replication on index:" + request.indexName)
+                log.info("Stopping replication for index: ${request.indexName}")
 
-                // NOTE: We remove the block first before validation since it is harmless idempotent operations and
-                //       gives back control of the index even if any failure happens in one of the steps post this.
-                val updateIndexBlockRequest = UpdateIndexBlockRequest(request.indexName,IndexBlockUpdateType.REMOVE_BLOCK)
-                val updateIndexBlockResponse = client.suspendExecute(UpdateIndexBlockAction.INSTANCE, updateIndexBlockRequest, injectSecurityContext = true)
-                if(!updateIndexBlockResponse.isAcknowledged) {
-                    throw OpenSearchException("Failed to remove index block on ${request.indexName}")
+                validateStateAndCleanupIfNeeded(request.indexName)
+                removeIndexBlocks(request.indexName)
+
+                val cleanupResult = taskCleanupManager.cleanupAllReplicationTasks(request.indexName)
+
+                if (!isIndexRestoring(request.indexName) && state.routingTable.hasIndex(request.indexName)) {
+                    handleIndexCloseReopen(request.indexName)
                 }
 
-                validateReplicationStateOfIndex(request)
-
-                // Index will be deleted if replication is stopped while it is restoring.  So no need to close/reopen
-                val restoring = clusterService.state().custom<RestoreInProgress>(RestoreInProgress.TYPE, RestoreInProgress.EMPTY).any { entry ->
-                    entry.indices().any { it == request.indexName }
+                if (cleanupResult.success || cleanupResult.hasCriticalSuccess()) {
+                    updateClusterState(request.indexName)
+                    replicationMetadataManager.deleteIndexReplicationMetadata(request.indexName)
+                    log.info("Successfully stopped replication for ${request.indexName}")
+                    listener.onResponse(AcknowledgedResponse(true))
+                } else {
+                    throw OpenSearchException(
+                        "Failed to cleanup replication tasks for ${request.indexName}: ${cleanupResult.failures}"
+                    )
                 }
-                if(restoring) {
-                    log.info("Index[${request.indexName}] is in restoring stage")
-                }
-                if (!restoring &&
-                        state.routingTable.hasIndex(request.indexName)) {
-
-                    var updateRequest = UpdateMetadataRequest(request.indexName, UpdateMetadataRequest.Type.CLOSE, Requests.closeIndexRequest(request.indexName))
-                    var closeResponse = client.suspendExecute(UpdateMetadataAction.INSTANCE, updateRequest, injectSecurityContext = true)
-                    if (!closeResponse.isAcknowledged) {
-                        throw OpenSearchException("Unable to close index: ${request.indexName}")
-                    }
-                }
-
-                try {
-                    val replMetadata = replicationMetadataManager.getIndexReplicationMetadata(request.indexName)
-                    val remoteClient = client.getRemoteClusterClient(replMetadata.connectionName)
-                    val retentionLeaseHelper = RemoteClusterRetentionLeaseHelper(clusterService.clusterName.value(), clusterService.state().metadata.clusterUUID(), remoteClient)
-                    retentionLeaseHelper.attemptRemoveRetentionLease(clusterService, replMetadata, request.indexName)
-                } catch(e: Exception) {
-                    log.error("Failed to remove retention lease from the leader cluster", e)
-                }
-
-                val clusterStateUpdateResponse : AcknowledgedResponse =
-                        clusterService.waitForClusterStateUpdate("stop_replication") { l -> StopReplicationTask(request, l)}
-                if (!clusterStateUpdateResponse.isAcknowledged) {
-                    throw OpenSearchException("Failed to update cluster state")
-                }
-
-                // Index will be deleted if stop is called while it is restoring. So no need to reopen
-                if (!restoring &&
-                        state.routingTable.hasIndex(request.indexName)) {
-                    val reopenResponse = client.suspending(client.admin().indices()::open, injectSecurityContext = true)(OpenIndexRequest(request.indexName))
-                    if (!reopenResponse.isAcknowledged) {
-                        throw OpenSearchException("Failed to reopen index: ${request.indexName}")
-                    }
-                }
-                replicationMetadataManager.deleteIndexReplicationMetadata(request.indexName)
-                removeStaleReplicationTasksFromClusterState(request)
-                listener.onResponse(AcknowledgedResponse(true))
             } catch (e: Exception) {
-                log.error("Stop replication failed for index[${request.indexName}] with error ${e.stackTraceToString()}")
+                log.error("Stop replication failed for ${request.indexName}: ${e.stackTraceToString()}")
                 listener.onFailure(e)
             }
         }
     }
 
-    private suspend fun removeStaleReplicationTasksFromClusterState(request: StopIndexReplicationRequest) {
-        try {
-            val allTasks: PersistentTasksCustomMetadata =
-                clusterService.state().metadata().custom(PersistentTasksCustomMetadata.TYPE)
-            for (singleTask in allTasks.tasks()) {
-                if (isReplicationTask(singleTask, request) && !singleTask.isAssigned){
-                    log.info("Removing task: ${singleTask.id} from cluster state")
-                    val removeRequest: RemovePersistentTaskAction.Request =
-                        RemovePersistentTaskAction.Request(singleTask.id)
-                    client.suspendExecute(RemovePersistentTaskAction.INSTANCE, removeRequest)
-                }
+    /**
+     * Validates current state and performs cleanup if needed.
+     * Implements idempotent behavior by handling already-stopped state gracefully.
+     */
+    private suspend fun validateStateAndCleanupIfNeeded(indexName: String) {
+        val replicationStateParams = getReplicationStateParamsForIndex(clusterService, indexName)
+
+        if (replicationStateParams == null) {
+            handleMissingReplicationState(indexName)
+            return
+        }
+
+        val currentState = replicationStateParams[REPLICATION_LAST_KNOWN_OVERALL_STATE]
+
+        when (currentState) {
+            ReplicationOverallState.STOPPED.name -> {
+                log.info("Replication already stopped for $indexName - performing cleanup for consistency")
+                // Idempotent: cleanup any remaining artifacts
             }
-        } catch (e: Exception) {
-            log.info("Could not update cluster state")
+            ReplicationOverallState.RUNNING.name,
+            ReplicationOverallState.FAILED.name,
+            ReplicationOverallState.PAUSED.name -> {
+                // Valid states for stopping - proceed
+            }
+            else -> {
+                throw IllegalStateException("Unknown replication state: $currentState")
+            }
         }
     }
 
-    // Remove index replication task metadata, format replication:index:fruit-1
-    // Remove shard replication task metadata, format replication:[fruit-1][0]
-    private fun isReplicationTask(
-        singleTask: PersistentTasksCustomMetadata.PersistentTask<*>,
-        request: StopIndexReplicationRequest
-    ) = singleTask.id.startsWith("replication:") &&
-            (singleTask.id == "replication:index:${request.indexName}" || singleTask.id.split(":")[1].contains(request.indexName))
+    /**
+     * Handles case where no replication state exists but stale artifacts might remain.
+     */
+    private suspend fun handleMissingReplicationState(indexName: String) {
+        val artifactReport = staleArtifactDetector.detectStaleArtifacts(indexName)
 
-
-    private fun validateReplicationStateOfIndex(request: StopIndexReplicationRequest) {
-        // If replication blocks/settings are present, Stop action should proceed with the clean-up
-        // This can happen during settings of follower index are carried over in the snapshot and the restore is
-        // performed using this snapshot.
-        if (clusterService.state().blocks.hasIndexBlock(request.indexName, INDEX_REPLICATION_BLOCK)
-                || clusterService.state().metadata.index(request.indexName)?.settings?.get(REPLICATED_INDEX_SETTING.key) != null) {
-            return
-        }
-
-        //check for stale replication tasks
-        val allTasks: PersistentTasksCustomMetadata? =
-            clusterService.state()?.metadata()?.custom(PersistentTasksCustomMetadata.TYPE)
-        allTasks?.tasks()?.forEach{
-            if (isReplicationTask(it, request) && !it.isAssigned){
-                return
+        if (artifactReport.hasStaleArtifacts) {
+            log.info("Found ${artifactReport.artifacts.size} stale artifacts for $indexName, cleaning up")
+            try {
+                taskCleanupManager.cleanupStaleArtifacts(indexName)
+            } catch (e: Exception) {
+                log.warn("Stale artifact cleanup failed for $indexName", e)
             }
         }
+    }
 
-        val replicationStateParams = getReplicationStateParamsForIndex(clusterService, request.indexName)
-                ?:
-            throw IllegalArgumentException("No replication in progress for index:${request.indexName}")
-        val replicationOverallState = replicationStateParams[REPLICATION_LAST_KNOWN_OVERALL_STATE]
-        if (replicationOverallState == ReplicationOverallState.RUNNING.name ||
-            replicationOverallState == ReplicationOverallState.STOPPED.name ||
-            replicationOverallState == ReplicationOverallState.FAILED.name ||
-            replicationOverallState == ReplicationOverallState.PAUSED.name)
-            return
-        throw IllegalStateException("Unknown value of replication state:$replicationOverallState")
+    /**
+     * Removes index blocks in an idempotent manner.
+     */
+    private suspend fun removeIndexBlocks(indexName: String) {
+        try {
+            val updateIndexBlockRequest = UpdateIndexBlockRequest(indexName, IndexBlockUpdateType.REMOVE_BLOCK)
+            val response = client.suspendExecute(UpdateIndexBlockAction.INSTANCE,updateIndexBlockRequest, injectSecurityContext = true)
+
+            if (!response.isAcknowledged) {
+                log.warn("Failed to remove index block on $indexName, continuing with cleanup")
+            }
+        } catch (e: Exception) {
+            log.warn("Exception while removing index block for $indexName", e)
+        }
+    }
+
+    /**
+     * Checks if the index is currently being restored.
+     */
+    private fun isIndexRestoring(indexName: String): Boolean {
+        return clusterService.state()
+            .custom<RestoreInProgress>(RestoreInProgress.TYPE, RestoreInProgress.EMPTY)
+            .any { entry -> entry.indices().any { it == indexName } }
+    }
+
+    /**
+     * Handles index close and reopen operations during stop.
+     */
+    private suspend fun handleIndexCloseReopen(indexName: String) {
+        try {
+            val updateRequest = UpdateMetadataRequest(
+                indexName,
+                UpdateMetadataRequest.Type.CLOSE,
+                Requests.closeIndexRequest(indexName)
+            )
+            val closeResponse = client.suspendExecute(
+                UpdateMetadataAction.INSTANCE,
+                updateRequest,
+                injectSecurityContext = true
+            )
+
+            if (!closeResponse.isAcknowledged) {
+                throw OpenSearchException("Unable to close index: $indexName")
+            }
+
+            val reopenResponse = client.suspending(
+                client.admin().indices()::open,
+                injectSecurityContext = true
+            )(OpenIndexRequest(indexName))
+
+            if (!reopenResponse.isAcknowledged) {
+                throw OpenSearchException("Failed to reopen index: $indexName")
+            }
+        } catch (e: Exception) {
+            log.error("Failed to handle index close/reopen for $indexName", e)
+            throw e
+        }
+    }
+
+    /**
+     * Updates cluster state to remove replication blocks and settings.
+     */
+    private suspend fun updateClusterState(indexName: String) {
+        val response: AcknowledgedResponse = clusterService.waitForClusterStateUpdate("stop_replication") { l ->
+            StopReplicationTask(StopIndexReplicationRequest(indexName), l)
+        }
+
+        if (!response.isAcknowledged) {
+            throw OpenSearchException("Failed to update cluster state for $indexName")
+        }
     }
 
     override fun executor(): String {
@@ -228,7 +263,6 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
 
         override fun execute(currentState: ClusterState): ClusterState {
             val newState = ClusterState.builder(currentState)
-
             // remove index block
             if (currentState.blocks.hasIndexBlock(request.indexName, INDEX_REPLICATION_BLOCK)) {
                 val newBlocks = ClusterBlocks.builder().blocks(currentState.blocks)
@@ -247,7 +281,6 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
                 mdBuilder.put(newIndexMetadata)
             }
             newState.metadata(mdBuilder)
-
             return newState.build()
         }
 
