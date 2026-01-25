@@ -87,8 +87,7 @@ class TransportResumeIndexReplicationAction @Inject constructor(transportService
                 
                 val replMetdata = replicationMetadataManager.getIndexReplicationMetadata(request.indexName)
                 val remoteMetadata = getLeaderIndexMetadata(replMetdata.connectionName, replMetdata.leaderContext.resource)
-                val params = IndexReplicationParams(replMetdata.connectionName, remoteMetadata.index, request.indexName)
-                
+                val params = IndexReplicationParams(replMetdata.connectionName, remoteMetadata.index, request.indexName) 
                 if (!isResumable(params)) {
                     throw ResourceNotFoundException("Retention lease doesn't exist. Replication can't be resumed for ${request.indexName}")
                 }
