@@ -15,6 +15,8 @@ import org.opensearch.replication.ReplicationPlugin
 import org.opensearch.replication.action.setup.SetupChecksAction
 import org.opensearch.replication.action.setup.SetupChecksRequest
 import org.opensearch.replication.metadata.store.ReplicationContext
+import org.opensearch.replication.task.cleanup.StaleArtifactDetector
+import org.opensearch.replication.task.cleanup.TaskCleanupManager
 import org.opensearch.replication.util.SecurityContext
 import org.opensearch.replication.util.ValidationUtil
 import org.opensearch.replication.util.completeWith
@@ -52,7 +54,9 @@ class TransportReplicateIndexAction @Inject constructor(transportService: Transp
                                                         actionFilters: ActionFilters,
                                                         private val client : Client,
                                                         private val environment: Environment,
-                                                        private val metadataCreateIndexService: MetadataCreateIndexService) :
+                                                        private val metadataCreateIndexService: MetadataCreateIndexService,
+                                                        private val staleArtifactDetector: StaleArtifactDetector,
+                                                        private val taskCleanupManager: TaskCleanupManager) :
         HandledTransportAction<ReplicateIndexRequest, ReplicateIndexResponse>(ReplicateIndexAction.NAME,
                 transportService, actionFilters, ::ReplicateIndexRequest),
     CoroutineScope by GlobalScope {
@@ -65,47 +69,37 @@ class TransportReplicateIndexAction @Inject constructor(transportService: Transp
         launch(threadPool.coroutineContext()) {
             listener.completeWith {
                 log.info("Setting-up replication for ${request.leaderAlias}:${request.leaderIndex} -> ${request.followerIndex}")
+                
+                performPreOperationValidation(request.followerIndex)
+                
                 val user = SecurityContext.fromSecurityThreadContext(threadPool.threadContext)
-
                 val followerReplContext = ReplicationContext(request.followerIndex,
                         user?.overrideFgacRole(request.useRoles?.get(ReplicateIndexRequest.FOLLOWER_CLUSTER_ROLE)))
                 val leaderReplContext = ReplicationContext(request.leaderIndex,
                         user?.overrideFgacRole(request.useRoles?.get(ReplicateIndexRequest.LEADER_CLUSTER_ROLE)))
 
-                // For autofollow request, setup checks are already made during addition of the pattern with
-                // original user
+                // For autofollow, setup checks are already made during pattern addition
                 if(!request.isAutoFollowRequest) {
                     val setupChecksReq = SetupChecksRequest(followerReplContext, leaderReplContext, request.leaderAlias)
                     val setupChecksRes = client.suspendExecute(SetupChecksAction.INSTANCE, setupChecksReq)
                     if(!setupChecksRes.isAcknowledged) {
-                        log.error("Setup checks failed while triggering replication for ${request.leaderAlias}:${request.leaderIndex} -> " +
-                                "${request.followerIndex}")
-                        throw org.opensearch.replication.ReplicationException("Setup checks failed while setting-up replication for ${request.followerIndex}")
+                        throw org.opensearch.replication.ReplicationException("Setup checks failed for ${request.followerIndex}")
                     }
                 }
-
-                // Any checks on the settings is followed by setup checks to ensure all relevant changes are
-                // present across the plugins
-                // validate index metadata on the leader cluster
                 log.debug("Fetching leader cluster state for ${request.leaderIndex} index.")
+                // Validate leader index metadata and settings
                 val leaderClusterState = getLeaderClusterState(request.leaderAlias, request.leaderIndex)
                 ValidationUtil.validateLeaderIndexState(request.leaderAlias, request.leaderIndex, leaderClusterState)
 
                 val leaderSettings = getLeaderIndexSettings(request.leaderAlias, request.leaderIndex)
                 log.debug("Leader settings were fetched for ${request.leaderIndex} index.")
-
                 if (leaderSettings.keySet().contains(ReplicationPlugin.REPLICATED_INDEX_SETTING.key) and
                         !leaderSettings.get(ReplicationPlugin.REPLICATED_INDEX_SETTING.key).isNullOrBlank()) {
                     throw IllegalArgumentException("Cannot Replicate a Replicated Index ${request.leaderIndex}")
                 }
-
-                // Soft deletes should be enabled for replication to work.
                 if (!leaderSettings.getAsBoolean(IndexSettings.INDEX_SOFT_DELETES_SETTING.key, false)) {
-                    throw IllegalArgumentException("Cannot Replicate an index where the setting ${IndexSettings.INDEX_SOFT_DELETES_SETTING.key} is disabled")
+                    throw IllegalArgumentException("Cannot Replicate an index where ${IndexSettings.INDEX_SOFT_DELETES_SETTING.key} is disabled")
                 }
-
-                // Disabling knn checks as new api call will require us add roles in security index which will be a breaking call.
-//                ValidationUtil.checkKNNEligibility(getNodesInfoForPlugin(request.leaderAlias), request.leaderIndex)
 
                 ValidationUtil.validateIndexSettings(
                     environment,
@@ -115,8 +109,6 @@ class TransportReplicateIndexAction @Inject constructor(transportService: Transp
                     metadataCreateIndexService
                 )
 
-                // Setup checks are successful and trigger replication for the index
-                // permissions evaluation to trigger replication is based on the current security context set
                 val internalReq = ReplicateIndexClusterManagerNodeRequest(user, request)
                 log.debug("Starting replication index action on current master node")
                 client.suspendExecute(ReplicateIndexClusterManagerNodeAction.INSTANCE, internalReq)
@@ -140,14 +132,6 @@ class TransportReplicateIndexAction @Inject constructor(transportService: Transp
                 injectSecurityContext = true, defaultContext = true)(clusterStateRequest).state
     }
 
-    private suspend fun getNodesInfoForPlugin(leaderAlias: String): NodesInfoResponse {
-        val remoteClient = client.getRemoteClusterClient(leaderAlias)
-        var nodesInfoRequest = NodesInfoRequest().addMetric(NodesInfoRequest.Metric.PLUGINS.metricName())
-        return remoteClient.suspending(
-            remoteClient.admin().cluster()::nodesInfo
-        )(nodesInfoRequest)
-    }
-
     private suspend fun getLeaderIndexSettings(leaderAlias: String, leaderIndex: String): Settings {
         val remoteClient = client.getRemoteClusterClient(leaderAlias)
         val getSettingsRequest = GetSettingsRequest().includeDefaults(true).indices(leaderIndex)
@@ -161,8 +145,33 @@ class TransportReplicateIndexAction @Inject constructor(transportService: Transp
         val leaderDefaultSettings = settingsResponse.indexToDefaultSettings.get(leaderIndex)
             ?: throw IndexNotFoundException("${leaderAlias}:${leaderIndex}")
 
-        // Since we want user configured as well as default settings, we combine both by putting default settings
-        // and then the explicitly set ones to override the default settings.
         return Settings.builder().put(leaderDefaultSettings).put(leaderSettings).build()
+    }
+
+    /**
+     * Validates no conflicting stale tasks exist before starting replication.
+     * Automatically cleans up all stale artifacts if detected.
+     */
+    private suspend fun performPreOperationValidation(followerIndex: String) {
+        val staleArtifactReport = staleArtifactDetector.detectStaleArtifacts(followerIndex)
+        
+        if (!staleArtifactReport.hasStaleArtifacts) return
+        
+        log.warn("Detected ${staleArtifactReport.artifacts.size} stale artifacts for $followerIndex")
+        log.info("Attempting cleanup of stale artifacts")
+        
+        val cleanupResult = taskCleanupManager.cleanupAllReplicationTasks(followerIndex)
+        
+        if (!cleanupResult.success) {
+            val failures = cleanupResult.failures.joinToString("; ") { "${it.component}: ${it.error}" }
+            throw IllegalStateException(
+                "Cannot start replication for $followerIndex due to conflicting stale tasks. " +
+                "Cleanup failed: $failures. Please manually resolve these conflicts."
+            )
+        }
+        
+        log.info("Cleaned up stale artifacts: ${cleanupResult.indexTasksRemoved} index tasks, " +
+                "${cleanupResult.shardTasksRemoved} shard tasks, ${cleanupResult.retentionLeasesRemoved} leases, " +
+                "${cleanupResult.persistentTasksRemoved} persistent tasks")
     }
 }

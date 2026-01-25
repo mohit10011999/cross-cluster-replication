@@ -18,9 +18,6 @@ import kotlinx.coroutines.launch
 import org.apache.logging.log4j.LogManager
 import org.opensearch.ResourceAlreadyExistsException
 import org.opensearch.ResourceNotFoundException
-import org.opensearch.action.admin.cluster.node.info.NodeInfo
-import org.opensearch.action.admin.cluster.node.info.NodesInfoRequest
-import org.opensearch.action.admin.cluster.node.info.PluginsAndModules
 import org.opensearch.action.admin.indices.settings.get.GetSettingsRequest
 import org.opensearch.action.support.ActionFilters
 import org.opensearch.action.support.IndicesOptions
@@ -45,6 +42,8 @@ import org.opensearch.replication.metadata.state.REPLICATION_LAST_KNOWN_OVERALL_
 import org.opensearch.replication.metadata.state.getReplicationStateParamsForIndex
 import org.opensearch.replication.seqno.RemoteClusterRetentionLeaseHelper
 import org.opensearch.replication.task.ReplicationState
+import org.opensearch.replication.task.cleanup.StaleArtifactDetector
+import org.opensearch.replication.task.cleanup.TaskCleanupManager
 import org.opensearch.replication.task.index.IndexReplicationExecutor
 import org.opensearch.replication.task.index.IndexReplicationParams
 import org.opensearch.replication.task.index.IndexReplicationState
@@ -53,8 +52,6 @@ import org.opensearch.threadpool.ThreadPool
 import org.opensearch.transport.TransportService
 import org.opensearch.transport.client.Client
 import java.io.IOException
-import java.util.function.Function
-import java.util.stream.Collectors
 
 
 class TransportResumeIndexReplicationAction @Inject constructor(transportService: TransportService,
@@ -64,7 +61,9 @@ class TransportResumeIndexReplicationAction @Inject constructor(transportService
                                                                 indexNameExpressionResolver: IndexNameExpressionResolver,
                                                                 val client: Client,
                                                                 val replicationMetadataManager: ReplicationMetadataManager,
-                                                                private val environment: Environment) :
+                                                                private val environment: Environment,
+                                                                private val staleArtifactDetector: StaleArtifactDetector,
+                                                                private val taskCleanupManager: TaskCleanupManager) :
     TransportClusterManagerNodeAction<ResumeIndexReplicationRequest, AcknowledgedResponse> (ResumeIndexReplicationAction.NAME,
             transportService, clusterService, threadPool, actionFilters, ::ResumeIndexReplicationRequest,
             indexNameExpressionResolver), CoroutineScope by GlobalScope {
@@ -83,10 +82,13 @@ class TransportResumeIndexReplicationAction @Inject constructor(transportService
         launch(Dispatchers.Unconfined + threadPool.coroutineContext()) {
             listener.completeWith {
                 log.info("Resuming index replication on index:" + request.indexName)
+                
                 validateResumeReplicationRequest(request)
+                
                 val replMetdata = replicationMetadataManager.getIndexReplicationMetadata(request.indexName)
                 val remoteMetadata = getLeaderIndexMetadata(replMetdata.connectionName, replMetdata.leaderContext.resource)
                 val params = IndexReplicationParams(replMetdata.connectionName, remoteMetadata.index, request.indexName)
+                
                 if (!isResumable(params)) {
                     throw ResourceNotFoundException("Retention lease doesn't exist. Replication can't be resumed for ${request.indexName}")
                 }
@@ -100,9 +102,6 @@ class TransportResumeIndexReplicationAction @Inject constructor(transportService
 
                 val leaderSettings = settingsResponse.indexToSettings.get(params.leaderIndex.name) ?: throw IndexNotFoundException(params.leaderIndex.name)
 
-                // Disabling knn checks as new api call will require us add roles in security index which will be a breaking call.
-//                ValidationUtil.checkKNNEligibility(nodesInfoResponse, params.leaderIndex.name)
-
                 ValidationUtil.validateAnalyzerSettings(environment, leaderSettings, replMetdata.settings)
 
                 replicationMetadataManager.updateIndexReplicationState(request.indexName, ReplicationOverallState.RUNNING)
@@ -114,7 +113,6 @@ class TransportResumeIndexReplicationAction @Inject constructor(transportService
                     listener.onResponse(ReplicateIndexResponse(false))
                 }
 
-                // Now wait for the replication to start and the follower index to get created before returning
                 persistentTasksService.waitForTaskCondition(task.id, request.timeout()) { t ->
                     val replicationState = (t.state as IndexReplicationState?)?.state
                     replicationState == ReplicationState.FOLLOWING
@@ -125,28 +123,21 @@ class TransportResumeIndexReplicationAction @Inject constructor(transportService
         }
     }
 
-    private suspend fun isResumable(params :IndexReplicationParams): Boolean {
-        var isResumable = true
+    private suspend fun isResumable(params: IndexReplicationParams): Boolean {
         val remoteClient = client.getRemoteClusterClient(params.leaderAlias)
-        val shards = clusterService.state().routingTable.indicesRouting().get(params.followerIndexName)?.shards()
+        val shards = clusterService.state().routingTable.indicesRouting().get(params.followerIndexName)?.shards() ?: return false
         val retentionLeaseHelper = RemoteClusterRetentionLeaseHelper(clusterService.clusterName.value(), clusterService.state().metadata.clusterUUID(), remoteClient)
-        shards?.forEach {
+        
+        val allLeasesExist = shards.all { 
             val followerShardId = it.value.shardId
-
-            if  (!retentionLeaseHelper.verifyRetentionLeaseExist(ShardId(params.leaderIndex, followerShardId.id), followerShardId)) {
-                isResumable = false
-            }
+            retentionLeaseHelper.verifyRetentionLeaseExist(ShardId(params.leaderIndex, followerShardId.id), followerShardId)
         }
 
-        if (isResumable) {
-            return true
-        }
+        if (allLeasesExist) return true
 
-        // clean up all retention leases we may have accidentally took while doing verifyRetentionLeaseExist .
-        // Idempotent Op which does no harm
-        shards?.forEach {
+        // Clean up any retention leases created during verification
+        shards.forEach {
             val followerShardId = it.value.shardId
-            log.debug("Removing lease for $followerShardId.id ")
             retentionLeaseHelper.attemptRetentionLeaseRemoval(ShardId(params.leaderIndex, followerShardId.id), followerShardId)
         }
 
@@ -167,12 +158,12 @@ class TransportResumeIndexReplicationAction @Inject constructor(transportService
 
     private fun validateResumeReplicationRequest(request: ResumeIndexReplicationRequest) {
         val replicationStateParams = getReplicationStateParamsForIndex(clusterService, request.indexName)
-                ?:
-            throw IllegalArgumentException("No replication in progress for index:${request.indexName}")
+            ?: throw IllegalArgumentException("No replication in progress for index:${request.indexName}")
+        
         val replicationOverallState = replicationStateParams[REPLICATION_LAST_KNOWN_OVERALL_STATE]
-
-        if (replicationOverallState != ReplicationOverallState.PAUSED.name)
+        if (replicationOverallState != ReplicationOverallState.PAUSED.name) {
             throw ResourceAlreadyExistsException("Replication on Index ${request.indexName} is already running")
+        }
     }
 
     override fun executor(): String {
