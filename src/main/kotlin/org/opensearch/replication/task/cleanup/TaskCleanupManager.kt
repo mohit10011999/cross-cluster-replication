@@ -115,16 +115,20 @@ class TaskCleanupManager @Inject constructor(
         val failures = mutableListOf<CleanupFailure>()
         var leasesRemoved = 0
         
+        // If no metadata provided, skip retention lease removal
+        if (replMetadata == null) {
+            log.debug("No replication metadata provided for $indexName, skipping retention lease removal")
+            return RetentionLeaseCleanupResult(0, emptyList())
+        }
+        
         try {
-            // Use provided metadata or fetch it
-            val metadata = replMetadata ?: replicationMetadataManager.getIndexReplicationMetadata(indexName)
             val retentionLeaseHelper = RemoteClusterRetentionLeaseHelper(
                 clusterService.clusterName.value(), 
                 clusterService.state().metadata.clusterUUID(), 
-                client.getRemoteClusterClient(metadata.connectionName)
+                client.getRemoteClusterClient(replMetadata.connectionName)
             )
             
-            retentionLeaseHelper.attemptRemoveRetentionLease(clusterService, metadata, indexName)
+            retentionLeaseHelper.attemptRemoveRetentionLease(clusterService, replMetadata, indexName)
             leasesRemoved = 1
         } catch (e: Exception) {
             failures.add(CleanupFailure(CleanupFailure.COMPONENT_RETENTION_LEASE, null,
