@@ -108,7 +108,15 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
                 validateStateAndCleanupIfNeeded(request.indexName)
                 removeIndexBlocks(request.indexName)
 
-                val cleanupResult = taskCleanupManager.cleanupAllReplicationTasks(request.indexName)
+                // Get metadata before cleanup so retention lease removal can use it
+                val replMetadata = try {
+                    replicationMetadataManager.getIndexReplicationMetadata(request.indexName)
+                } catch (e: Exception) {
+                    log.debug("No replication metadata found for ${request.indexName}, skipping retention lease removal")
+                    null
+                }
+
+                val cleanupResult = taskCleanupManager.cleanupAllReplicationTasks(request.indexName, replMetadata)
 
                 if (!isIndexRestoring(request.indexName) && state.routingTable.hasIndex(request.indexName)) {
                     handleIndexCloseReopen(request.indexName)

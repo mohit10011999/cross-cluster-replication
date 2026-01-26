@@ -16,6 +16,7 @@ import org.opensearch.replication.action.index.block.IndexBlockUpdateType
 import org.opensearch.replication.action.index.block.UpdateIndexBlockAction
 import org.opensearch.replication.action.index.block.UpdateIndexBlockRequest
 import org.opensearch.replication.metadata.ReplicationMetadataManager
+import org.opensearch.replication.metadata.store.ReplicationMetadata
 import org.opensearch.replication.seqno.RemoteClusterRetentionLeaseHelper
 import org.opensearch.replication.task.index.IndexReplicationExecutor
 import org.opensearch.replication.task.index.IndexReplicationParams
@@ -67,13 +68,13 @@ class TaskCleanupManager @Inject constructor(
         const val CLEANUP_RETRY_DELAY_MS = 1000L
     }
 
-    suspend fun cleanupAllReplicationTasks(indexName: String): CleanupResult {
+    suspend fun cleanupAllReplicationTasks(indexName: String, replMetadata: ReplicationMetadata? = null): CleanupResult {
         val failures = mutableListOf<CleanupFailure>()
         
         return try {
             val shardResult = removeShardReplicationTasks(indexName)
             val indexResult = removeIndexReplicationTask(indexName)
-            val leaseResult = removeRetentionLeases(indexName)
+            val leaseResult = removeRetentionLeases(indexName, replMetadata)
             val persistentResult = removePersistentTasks(indexName)
             
             failures.addAll(shardResult.failures + indexResult.failures + leaseResult.failures + persistentResult.failures)
@@ -110,19 +111,20 @@ class TaskCleanupManager @Inject constructor(
         }
     }
 
-    suspend fun removeRetentionLeases(indexName: String): RetentionLeaseCleanupResult {
+    suspend fun removeRetentionLeases(indexName: String, replMetadata: ReplicationMetadata? = null): RetentionLeaseCleanupResult {
         val failures = mutableListOf<CleanupFailure>()
         var leasesRemoved = 0
         
         try {
-            val replMetadata = replicationMetadataManager.getIndexReplicationMetadata(indexName)
+            // Use provided metadata or fetch it
+            val metadata = replMetadata ?: replicationMetadataManager.getIndexReplicationMetadata(indexName)
             val retentionLeaseHelper = RemoteClusterRetentionLeaseHelper(
                 clusterService.clusterName.value(), 
                 clusterService.state().metadata.clusterUUID(), 
-                client.getRemoteClusterClient(replMetadata.connectionName)
+                client.getRemoteClusterClient(metadata.connectionName)
             )
             
-            retentionLeaseHelper.attemptRemoveRetentionLease(clusterService, replMetadata, indexName)
+            retentionLeaseHelper.attemptRemoveRetentionLease(clusterService, metadata, indexName)
             leasesRemoved = 1
         } catch (e: Exception) {
             failures.add(CleanupFailure(CleanupFailure.COMPONENT_RETENTION_LEASE, null,
