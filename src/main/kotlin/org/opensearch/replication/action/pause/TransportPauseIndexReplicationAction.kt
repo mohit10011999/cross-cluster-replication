@@ -158,7 +158,7 @@ class TransportPauseIndexReplicationAction @Inject constructor(transportService:
 
         if (restoring) {
             throw OpenSearchException(
-                "Index is in restore phase for $indexName. Pause after restore completes."
+                "Index is in restore phase currently for index: $indexName"
             )
         }
     }
