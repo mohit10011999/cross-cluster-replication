@@ -124,7 +124,14 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
 
                 if (cleanupResult.success || cleanupResult.hasCriticalSuccess()) {
                     updateClusterState(request.indexName)
-                    replicationMetadataManager.deleteIndexReplicationMetadata(request.indexName)
+                    
+                    // Delete metadata if it exists (idempotent - don't fail if already gone)
+                    try {
+                        replicationMetadataManager.deleteIndexReplicationMetadata(request.indexName)
+                    } catch (e: Exception) {
+                        log.debug("Metadata already deleted or doesn't exist for ${request.indexName}")
+                    }
+                    
                     log.info("Successfully stopped replication for ${request.indexName}")
                     listener.onResponse(AcknowledgedResponse(true))
                 } else {
