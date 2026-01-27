@@ -147,13 +147,13 @@ class TaskCleanupManager @Inject constructor(
                     // Other OpenSearch errors - log but don't fail
                     log.warn("Failed to remove retention lease for $indexName: ${e.message}")
                 }
-            } catch (e: Exception) {
-                // Other errors during retention lease removal (network, timeout, etc.) - log but don't fail
-                log.warn("Failed to remove retention lease for $indexName: ${e.message}")
+            } catch (e: Throwable) {
+                // Catch all other throwables (including errors) - log but don't fail
+                log.warn("Failed to remove retention lease for $indexName: ${e.message}", e)
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             // Errors during helper initialization or remote client access - log but don't fail the operation
-            log.warn("Failed to initialize retention lease helper for $indexName: ${e.message}")
+            log.warn("Failed to initialize retention lease helper for $indexName: ${e.message}", e)
         }
         
         return RetentionLeaseCleanupResult(leasesRemoved, failures)
