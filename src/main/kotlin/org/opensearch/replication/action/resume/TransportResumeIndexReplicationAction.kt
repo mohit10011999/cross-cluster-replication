@@ -101,6 +101,9 @@ class TransportResumeIndexReplicationAction @Inject constructor(transportService
 
                 val leaderSettings = settingsResponse.indexToSettings.get(params.leaderIndex.name) ?: throw IndexNotFoundException(params.leaderIndex.name)
 
+                // Disabling knn checks as new api call will require us add roles in security index which will be a breaking call.
+//                ValidationUtil.checkKNNEligibility(nodesInfoResponse, params.leaderIndex.name)
+
                 ValidationUtil.validateAnalyzerSettings(environment, leaderSettings, replMetdata.settings)
 
                 replicationMetadataManager.updateIndexReplicationState(request.indexName, ReplicationOverallState.RUNNING)
@@ -111,7 +114,8 @@ class TransportResumeIndexReplicationAction @Inject constructor(transportService
                     log.error("Failed to assign task")
                     listener.onResponse(ReplicateIndexResponse(false))
                 }
-
+                
+                // Now wait for the replication to start and the follower index to get created before returning
                 persistentTasksService.waitForTaskCondition(task.id, request.timeout()) { t ->
                     val replicationState = (t.state as IndexReplicationState?)?.state
                     replicationState == ReplicationState.FOLLOWING
@@ -134,7 +138,8 @@ class TransportResumeIndexReplicationAction @Inject constructor(transportService
 
         if (allLeasesExist) return true
 
-        // Clean up any retention leases created during verification
+        // clean up all retention leases we may have accidentally took while doing verifyRetentionLeaseExist .
+        // Idempotent Op which does no harm
         shards.forEach {
             val followerShardId = it.value.shardId
             retentionLeaseHelper.attemptRetentionLeaseRemoval(ShardId(params.leaderIndex, followerShardId.id), followerShardId)
