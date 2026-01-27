@@ -128,11 +128,18 @@ class TaskCleanupManager @Inject constructor(
                 client.getRemoteClusterClient(replMetadata.connectionName)
             )
             
-            retentionLeaseHelper.attemptRemoveRetentionLease(clusterService, replMetadata, indexName)
-            leasesRemoved = 1
+            // Attempt to remove retention lease - this may fail if leader index has validation issues
+            try {
+                retentionLeaseHelper.attemptRemoveRetentionLease(clusterService, replMetadata, indexName)
+                leasesRemoved = 1
+            } catch (e: IllegalArgumentException) {
+                // Leader index validation failed (e.g., synonym file issues) - log and continue
+                log.warn("Failed to validate leader index during retention lease removal for $indexName: ${e.message}. " +
+                        "Retention lease removal skipped but operation will continue.")
+            }
         } catch (e: Exception) {
-            failures.add(CleanupFailure(CleanupFailure.COMPONENT_RETENTION_LEASE, null,
-                "Failed to remove retention lease: ${e.message}", false))
+            // Other errors (network, timeout, etc.) - log but don't fail the operation
+            log.warn("Failed to remove retention lease for $indexName: ${e.message}")
         }
         
         return RetentionLeaseCleanupResult(leasesRemoved, failures)
