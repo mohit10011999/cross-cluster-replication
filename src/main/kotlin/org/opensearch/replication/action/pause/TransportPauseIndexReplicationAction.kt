@@ -76,17 +76,28 @@ class TransportPauseIndexReplicationAction @Inject constructor(transportService:
             try {
                 log.info("Pausing replication for index: ${request.indexName}")
 
+                // Check current state for idempotency logic
+                val replicationStateParams = getReplicationStateParamsForIndex(clusterService, request.indexName)
+                val currentState = replicationStateParams?.get(REPLICATION_LAST_KNOWN_OVERALL_STATE)
+                val isAlreadyPaused = currentState == ReplicationOverallState.PAUSED.name
+
                 validateStateAndCleanupIfNeeded(request.indexName)
                 checkNotRestoring(request.indexName)
 
                 val cleanupResult = taskCleanupManager.suspendReplicationTasks(request.indexName)
 
                 if (cleanupResult.success || cleanupResult.hasCriticalSuccess()) {
-                    replicationMetadataManager.updateIndexReplicationState(
-                        request.indexName,
-                        ReplicationOverallState.PAUSED,
-                        request.reason
-                    )
+                    // Only update state if not already PAUSED (idempotent optimization)
+                    if (!isAlreadyPaused) {
+                        replicationMetadataManager.updateIndexReplicationState(
+                            request.indexName,
+                            ReplicationOverallState.PAUSED,
+                            request.reason
+                        )
+                    } else {
+                        log.info("State already PAUSED for ${request.indexName}, skipping state update")
+                    }
+                    
                     log.info("Successfully paused replication for ${request.indexName}")
                     listener.onResponse(AcknowledgedResponse(true))
                 } else {
@@ -117,9 +128,8 @@ class TransportPauseIndexReplicationAction @Inject constructor(transportService:
 
         when (currentState) {
             ReplicationOverallState.PAUSED.name -> {
-                log.info("Index $indexName already paused - performing cleanup for consistency")
-                // Idempotent: cleanup any remaining artifacts (without removing retention leases)
-                taskCleanupManager.suspendReplicationTasks(indexName)
+                log.info("Index $indexName already paused - will verify cleanup in main flow")
+                // Don't cleanup here to avoid double cleanup - main flow will handle it
             }
             ReplicationOverallState.RUNNING.name -> {
                 // Normal case - proceed with pause
@@ -158,7 +168,7 @@ class TransportPauseIndexReplicationAction @Inject constructor(transportService:
 
         if (restoring) {
             throw OpenSearchException(
-                "Index is in restore phase currently for index: $indexName"
+                "Index is in restore phase for $indexName. Pause after restore completes."
             )
         }
     }
