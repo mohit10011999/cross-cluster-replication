@@ -78,16 +78,22 @@ class TransportReplicateIndexAction @Inject constructor(transportService: Transp
                 val leaderReplContext = ReplicationContext(request.leaderIndex,
                         user?.overrideFgacRole(request.useRoles?.get(ReplicateIndexRequest.LEADER_CLUSTER_ROLE)))
 
-                // For autofollow, setup checks are already made during pattern addition
+                // For autofollow request, setup checks are already made during addition of the pattern with
+                // original user
                 if(!request.isAutoFollowRequest) {
                     val setupChecksReq = SetupChecksRequest(followerReplContext, leaderReplContext, request.leaderAlias)
                     val setupChecksRes = client.suspendExecute(SetupChecksAction.INSTANCE, setupChecksReq)
                     if(!setupChecksRes.isAcknowledged) {
-                        throw org.opensearch.replication.ReplicationException("Setup checks failed for ${request.followerIndex}")
+                        log.error("Setup checks failed while triggering replication for ${request.leaderAlias}:${request.leaderIndex} -> " +
+                                "${request.followerIndex}")
+                        throw org.opensearch.replication.ReplicationException("Setup checks failed while setting-up replication for ${request.followerIndex}")
                     }
                 }
+
+                // Any checks on the settings is followed by setup checks to ensure all relevant changes are
+                // present across the plugins
+                // validate index metadata on the leader cluster
                 log.debug("Fetching leader cluster state for ${request.leaderIndex} index.")
-                // Validate leader index metadata and settings
                 val leaderClusterState = getLeaderClusterState(request.leaderAlias, request.leaderIndex)
                 ValidationUtil.validateLeaderIndexState(request.leaderAlias, request.leaderIndex, leaderClusterState)
 
@@ -101,6 +107,9 @@ class TransportReplicateIndexAction @Inject constructor(transportService: Transp
                     throw IllegalArgumentException("Cannot Replicate an index where ${IndexSettings.INDEX_SOFT_DELETES_SETTING.key} is disabled")
                 }
 
+                // Disabling knn checks as new api call will require us add roles in security index which will be a breaking call.
+//                ValidationUtil.checkKNNEligibility(getNodesInfoForPlugin(request.leaderAlias), request.leaderIndex)
+
                 ValidationUtil.validateIndexSettings(
                     environment,
                     request.followerIndex,
@@ -109,6 +118,8 @@ class TransportReplicateIndexAction @Inject constructor(transportService: Transp
                     metadataCreateIndexService
                 )
 
+                // Setup checks are successful and trigger replication for the index
+                // permissions evaluation to trigger replication is based on the current security context set
                 val internalReq = ReplicateIndexClusterManagerNodeRequest(user, request)
                 log.debug("Starting replication index action on current master node")
                 client.suspendExecute(ReplicateIndexClusterManagerNodeAction.INSTANCE, internalReq)
@@ -132,6 +143,14 @@ class TransportReplicateIndexAction @Inject constructor(transportService: Transp
                 injectSecurityContext = true, defaultContext = true)(clusterStateRequest).state
     }
 
+    private suspend fun getNodesInfoForPlugin(leaderAlias: String): NodesInfoResponse {
+        val remoteClient = client.getRemoteClusterClient(leaderAlias)
+        var nodesInfoRequest = NodesInfoRequest().addMetric(NodesInfoRequest.Metric.PLUGINS.metricName())
+        return remoteClient.suspending(
+            remoteClient.admin().cluster()::nodesInfo
+        )(nodesInfoRequest)
+    }
+
     private suspend fun getLeaderIndexSettings(leaderAlias: String, leaderIndex: String): Settings {
         val remoteClient = client.getRemoteClusterClient(leaderAlias)
         val getSettingsRequest = GetSettingsRequest().includeDefaults(true).indices(leaderIndex)
@@ -145,6 +164,8 @@ class TransportReplicateIndexAction @Inject constructor(transportService: Transp
         val leaderDefaultSettings = settingsResponse.indexToDefaultSettings.get(leaderIndex)
             ?: throw IndexNotFoundException("${leaderAlias}:${leaderIndex}")
 
+        // Since we want user configured as well as default settings, we combine both by putting default settings
+        // and then the explicitly set ones to override the default settings.
         return Settings.builder().put(leaderDefaultSettings).put(leaderSettings).build()
     }
 
