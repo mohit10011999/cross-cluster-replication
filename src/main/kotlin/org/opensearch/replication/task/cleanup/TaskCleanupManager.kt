@@ -134,12 +134,23 @@ class TaskCleanupManager @Inject constructor(
                 leasesRemoved = 1
             } catch (e: IllegalArgumentException) {
                 // Leader index validation failed (e.g., synonym file issues) - log and continue
+                // This can happen when getLeaderIndexMetadata() validates index settings
                 log.warn("Failed to validate leader index during retention lease removal for $indexName: ${e.message}. " +
                         "Retention lease removal skipped but operation will continue.")
+            } catch (e: Exception) {
+                // Check if this is a wrapped IllegalArgumentException (e.g., from index validation)
+                val cause = e.cause
+                if (cause is IllegalArgumentException || e.message?.contains("Failed to verify index") == true) {
+                    log.warn("Failed to validate leader index during retention lease removal for $indexName: ${e.message}. " +
+                            "Retention lease removal skipped but operation will continue.")
+                } else {
+                    // Other errors during retention lease removal (network, timeout, etc.) - log but don't fail
+                    log.warn("Failed to remove retention lease for $indexName: ${e.message}")
+                }
             }
         } catch (e: Exception) {
-            // Other errors (network, timeout, etc.) - log but don't fail the operation
-            log.warn("Failed to remove retention lease for $indexName: ${e.message}")
+            // Errors during helper initialization or remote client access - log but don't fail the operation
+            log.warn("Failed to initialize retention lease helper for $indexName: ${e.message}")
         }
         
         return RetentionLeaseCleanupResult(leasesRemoved, failures)
