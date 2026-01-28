@@ -20,7 +20,6 @@ import org.opensearch.replication.metadata.store.ReplicationMetadata
 import org.opensearch.replication.seqno.RemoteClusterRetentionLeaseHelper
 import org.opensearch.replication.util.suspendExecute
 import org.opensearch.replication.util.waitForClusterStateUpdate
-import kotlinx.coroutines.delay
 import org.apache.logging.log4j.LogManager
 import org.opensearch.transport.client.Client
 import org.opensearch.cluster.AckedClusterStateUpdateTask
@@ -74,9 +73,6 @@ class TaskCleanupManager @Inject constructor(
             val leaseResult = removeRetentionLeases(indexName, replMetadata)
             val persistentResult = removePersistentTasks(indexName)
             
-            // Note: We do NOT explicitly clean up stats from FollowerClusterStats here.
-            // Stats are cleaned up automatically by ShardReplicationTask.cleanup() when tasks are cancelled.
-            
             failures.addAll(leaseResult.failures + persistentResult.failures)
             
             CleanupResult(failures.isEmpty(), 0, 0,
@@ -102,9 +98,6 @@ class TaskCleanupManager @Inject constructor(
             
             val persistentResult = removePersistentTasks(indexName)
             
-            // Note: We do NOT explicitly clean up stats from FollowerClusterStats here.
-            // Stats are cleaned up automatically by ShardReplicationTask.cleanup() when tasks are cancelled.
-            
             failures.addAll(persistentResult.failures)
             
             CleanupResult(failures.isEmpty(), 0, 0,
@@ -115,7 +108,7 @@ class TaskCleanupManager @Inject constructor(
                 listOf(CleanupFailure(CleanupFailure.COMPONENT_CLEANUP_MANAGER, null, e.message ?: "Unknown error", false)))
         }
     }
-    
+
     suspend fun removeRetentionLeases(indexName: String, replMetadata: ReplicationMetadata? = null): RetentionLeaseCleanupResult {
         val failures = mutableListOf<CleanupFailure>()
         var leasesRemoved = 0
@@ -126,6 +119,8 @@ class TaskCleanupManager @Inject constructor(
             return RetentionLeaseCleanupResult(0, emptyList())
         }
         
+        // Wrap the entire retention lease removal in try-catch to handle any errors gracefully
+        // This includes errors from getRemoteClusterClient when cluster is removed/unavailable
         try {
             val retentionLeaseHelper = RemoteClusterRetentionLeaseHelper(
                 clusterService.clusterName.value(), 
@@ -133,32 +128,17 @@ class TaskCleanupManager @Inject constructor(
                 client.getRemoteClusterClient(replMetadata.connectionName)
             )
             
-            // Attempt to remove retention lease - this may fail if leader index has validation issues
-            try {
-                retentionLeaseHelper.attemptRemoveRetentionLease(clusterService, replMetadata, indexName)
-                leasesRemoved = 1
-            } catch (e: IllegalArgumentException) {
-                // Leader index validation failed (e.g., synonym file issues) - log and continue
-                // This can happen when getLeaderIndexMetadata() validates index settings
-                log.warn("Failed to validate leader index during retention lease removal for $indexName: ${e.message}. " +
-                        "Retention lease removal skipped but operation will continue.")
-            } catch (e: OpenSearchException) {
-                // Check if this is a wrapped IllegalArgumentException (e.g., from index validation)
-                val cause = e.cause
-                if (cause is IllegalArgumentException || e.message?.contains("Failed to verify index") == true) {
-                    log.warn("Failed to validate leader index during retention lease removal for $indexName: ${e.message}. " +
-                            "Retention lease removal skipped but operation will continue.")
-                } else {
-                    // Other OpenSearch errors - log but don't fail
-                    log.warn("Failed to remove retention lease for $indexName: ${e.message}")
-                }
-            } catch (e: Throwable) {
-                // Catch all other throwables (including errors) - log but don't fail
-                log.warn("Failed to remove retention lease for $indexName: ${e.message}", e)
-            }
+            retentionLeaseHelper.attemptRemoveRetentionLease(clusterService, replMetadata, indexName)
+            leasesRemoved = 1
         } catch (e: Throwable) {
-            // Errors during helper initialization or remote client access - log but don't fail the operation
-            log.warn("Failed to initialize retention lease helper for $indexName: ${e.message}", e)
+            // Log and continue - retention lease removal failure should not block STOP operation
+            // This handles cases where:
+            // - Leader cluster is unavailable
+            // - Leader cluster is removed from settings
+            // - Network issues prevent communication
+            // - Leader index validation fails
+            // Using Throwable to catch ALL exceptions including runtime errors
+            log.warn("Failed to remove retention lease for $indexName: ${e.message}", e)
         }
         
         return RetentionLeaseCleanupResult(leasesRemoved, failures)
@@ -169,46 +149,17 @@ class TaskCleanupManager @Inject constructor(
         var tasksRemoved = 0
         
         try {
-            // Wait for tasks to become unassigned after cancellation
-            // This gives the task framework time to mark cancelled tasks as unassigned
-            var retryCount = 0
-            val maxRetries = 10
-            val retryDelayMs = 100L
+            val allTasks = clusterService.state().metadata.custom<PersistentTasksCustomMetadata>(
+                PersistentTasksCustomMetadata.TYPE
+            ) ?: return PersistentTaskCleanupResult(0, emptyList())
             
-            while (retryCount < maxRetries) {
-                val allTasks = clusterService.state().metadata.custom<PersistentTasksCustomMetadata>(
-                    PersistentTasksCustomMetadata.TYPE
-                ) ?: return PersistentTaskCleanupResult(0, emptyList())
-                
-                val replicationTasks = allTasks.tasks()
-                    .filter { staleArtifactDetector.isReplicationTaskForIndex(it, indexName) }
-                
-                val unassignedTasks = replicationTasks.filter { !it.isAssigned }
-                val assignedTasks = replicationTasks.filter { it.isAssigned }
-                
-                // Remove all unassigned tasks
-                unassignedTasks.forEach { task ->
-                    try {
-                        client.suspendExecute(RemovePersistentTaskAction.INSTANCE, RemovePersistentTaskAction.Request(task.id))
-                        tasksRemoved++
-                        log.debug("Removed unassigned persistent task: ${task.id} for index: $indexName")
-                    } catch (e: Exception) {
-                        failures.add(CleanupFailure(CleanupFailure.COMPONENT_PERSISTENT_TASK, task.id,
-                            "Failed to remove from cluster state: ${e.message}", true))
-                    }
-                }
-                
-                // If there are still assigned tasks, wait and retry
-                if (assignedTasks.isNotEmpty() && retryCount < maxRetries - 1) {
-                    log.debug("Found ${assignedTasks.size} assigned tasks for $indexName, waiting for them to become unassigned (retry $retryCount/$maxRetries)")
-                    delay(retryDelayMs * (retryCount + 1))
-                    retryCount++
-                } else {
-                    // Either no assigned tasks left, or we've exhausted retries
-                    if (assignedTasks.isNotEmpty()) {
-                        log.warn("Still found ${assignedTasks.size} assigned tasks for $indexName after $maxRetries retries: ${assignedTasks.map { it.id }}")
-                    }
-                    break
+            allTasks.tasks().filter { staleArtifactDetector.isReplicationTaskForIndex(it, indexName) }.forEach { task ->
+                try {
+                    client.suspendExecute(RemovePersistentTaskAction.INSTANCE, RemovePersistentTaskAction.Request(task.id))
+                    tasksRemoved++
+                } catch (e: Exception) {
+                    failures.add(CleanupFailure(CleanupFailure.COMPONENT_PERSISTENT_TASK, task.id,
+                        "Failed to remove from cluster state: ${e.message}", true))
                 }
             }
         } catch (e: Exception) {
