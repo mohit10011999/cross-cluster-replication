@@ -166,7 +166,13 @@ class ShardReplicationTask(id: Long, type: String, action: String, description: 
         * it continues to be called even after the task is completed.
          */
         clusterService.removeListener(clusterStateListenerForTaskInterruption)
-        this.followerClusterStats.stats.remove(followerShardId)
+        log.info("Removing stats entry for shard $followerShardId in cleanup(). Current total stats: ${followerClusterStats.stats.size}")
+        val removed = this.followerClusterStats.stats.remove(followerShardId)
+        if (removed != null) {
+            log.info("Removed stats entry for shard $followerShardId in cleanup(). New total stats: ${followerClusterStats.stats.size}")
+        } else {
+            log.warn("Stats entry for shard $followerShardId was already removed. Total stats: ${followerClusterStats.stats.size}")
+        }
     }
 
     private fun addListenerToInterruptTask() {
@@ -209,7 +215,9 @@ class ShardReplicationTask(id: Long, type: String, action: String, description: 
         }
 
         addListenerToInterruptTask()
+        log.info("Adding stats entry for shard $followerShardId. Current total stats: ${followerClusterStats.stats.size}")
         this.followerClusterStats.stats[followerShardId] = FollowerShardMetric()
+        log.info("Added stats entry for shard $followerShardId. New total stats: ${followerClusterStats.stats.size}")
 
         // Since this setting is not dynamic, setting update would only reflect after pause-resume or on a new replication job.
         val rateLimiter = Semaphore(replicationSettings.readersPerShard)
