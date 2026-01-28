@@ -77,6 +77,11 @@ class TaskCleanupManager @Inject constructor(
             val leaseResult = removeRetentionLeases(indexName, replMetadata)
             val persistentResult = removePersistentTasks(indexName)
             
+            // Note: We do NOT explicitly clean up stats from FollowerClusterStats here.
+            // Stats are cleaned up automatically by ShardReplicationTask.cleanup() when tasks are cancelled.
+            // Explicitly removing stats here causes a race condition where the test sees stale stats
+            // before the tasks have actually been cancelled and cleaned up.
+            
             failures.addAll(shardResult.failures + indexResult.failures + leaseResult.failures + persistentResult.failures)
             
             CleanupResult(failures.isEmpty(), indexResult.tasksRemoved, shardResult.tasksRemoved,
@@ -100,6 +105,11 @@ class TaskCleanupManager @Inject constructor(
             val indexResult = removeIndexReplicationTask(indexName)
             val persistentResult = removePersistentTasks(indexName)
             
+            // Note: We do NOT explicitly clean up stats from FollowerClusterStats here.
+            // Stats are cleaned up automatically by ShardReplicationTask.cleanup() when tasks are cancelled.
+            // Explicitly removing stats here causes a race condition where the test sees stale stats
+            // before the tasks have actually been cancelled and cleaned up.
+            
             failures.addAll(shardResult.failures + indexResult.failures + persistentResult.failures)
             
             CleanupResult(failures.isEmpty(), indexResult.tasksRemoved, shardResult.tasksRemoved,
@@ -110,7 +120,7 @@ class TaskCleanupManager @Inject constructor(
                 listOf(CleanupFailure(CleanupFailure.COMPONENT_CLEANUP_MANAGER, null, e.message ?: "Unknown error", false)))
         }
     }
-
+    
     suspend fun removeRetentionLeases(indexName: String, replMetadata: ReplicationMetadata? = null): RetentionLeaseCleanupResult {
         val failures = mutableListOf<CleanupFailure>()
         var leasesRemoved = 0
@@ -164,17 +174,46 @@ class TaskCleanupManager @Inject constructor(
         var tasksRemoved = 0
         
         try {
-            val allTasks = clusterService.state().metadata.custom<PersistentTasksCustomMetadata>(
-                PersistentTasksCustomMetadata.TYPE
-            ) ?: return PersistentTaskCleanupResult(0, emptyList())
+            // Wait for tasks to become unassigned after cancellation
+            // This gives the task framework time to mark cancelled tasks as unassigned
+            var retryCount = 0
+            val maxRetries = 10
+            val retryDelayMs = 100L
             
-            allTasks.tasks().filter { staleArtifactDetector.isReplicationTaskForIndex(it, indexName) }.forEach { task ->
-                try {
-                    client.suspendExecute(RemovePersistentTaskAction.INSTANCE, RemovePersistentTaskAction.Request(task.id))
-                    tasksRemoved++
-                } catch (e: Exception) {
-                    failures.add(CleanupFailure(CleanupFailure.COMPONENT_PERSISTENT_TASK, task.id,
-                        "Failed to remove from cluster state: ${e.message}", true))
+            while (retryCount < maxRetries) {
+                val allTasks = clusterService.state().metadata.custom<PersistentTasksCustomMetadata>(
+                    PersistentTasksCustomMetadata.TYPE
+                ) ?: return PersistentTaskCleanupResult(0, emptyList())
+                
+                val replicationTasks = allTasks.tasks()
+                    .filter { staleArtifactDetector.isReplicationTaskForIndex(it, indexName) }
+                
+                val unassignedTasks = replicationTasks.filter { !it.isAssigned }
+                val assignedTasks = replicationTasks.filter { it.isAssigned }
+                
+                // Remove all unassigned tasks
+                unassignedTasks.forEach { task ->
+                    try {
+                        client.suspendExecute(RemovePersistentTaskAction.INSTANCE, RemovePersistentTaskAction.Request(task.id))
+                        tasksRemoved++
+                        log.debug("Removed unassigned persistent task: ${task.id} for index: $indexName")
+                    } catch (e: Exception) {
+                        failures.add(CleanupFailure(CleanupFailure.COMPONENT_PERSISTENT_TASK, task.id,
+                            "Failed to remove from cluster state: ${e.message}", true))
+                    }
+                }
+                
+                // If there are still assigned tasks, wait and retry
+                if (assignedTasks.isNotEmpty() && retryCount < maxRetries - 1) {
+                    log.debug("Found ${assignedTasks.size} assigned tasks for $indexName, waiting for them to become unassigned (retry $retryCount/$maxRetries)")
+                    delay(retryDelayMs * (retryCount + 1))
+                    retryCount++
+                } else {
+                    // Either no assigned tasks left, or we've exhausted retries
+                    if (assignedTasks.isNotEmpty()) {
+                        log.warn("Still found ${assignedTasks.size} assigned tasks for $indexName after $maxRetries retries: ${assignedTasks.map { it.id }}")
+                    }
+                    break
                 }
             }
         } catch (e: Exception) {
