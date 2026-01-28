@@ -79,8 +79,7 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
                                                               IndexNameExpressionResolver,
                                                               val client: Client,
                                                               val replicationMetadataManager: ReplicationMetadataManager,
-                                                              val persistentTasksService: PersistentTasksService,
-                                                              val followerClusterStats: org.opensearch.replication.task.shard.FollowerClusterStats) :
+                                                              val persistentTasksService: PersistentTasksService) :
     TransportClusterManagerNodeAction<StopIndexReplicationRequest, AcknowledgedResponse> (STOP_REPLICATION_ACTION_NAME,
             transportService, clusterService, threadPool, actionFilters, ::StopIndexReplicationRequest,
             indexNameExpressionResolver), CoroutineScope by GlobalScope {
@@ -92,7 +91,7 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
     private val staleArtifactDetector = StaleArtifactDetector(clusterService)
 
     private val taskCleanupManager = TaskCleanupManager(
-        persistentTasksService, clusterService, client, replicationMetadataManager, staleArtifactDetector, followerClusterStats
+        persistentTasksService, clusterService, client, replicationMetadataManager, staleArtifactDetector
     )
 
     override fun checkBlock(request: StopIndexReplicationRequest, state: ClusterState): ClusterBlockException? {
