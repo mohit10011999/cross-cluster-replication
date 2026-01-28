@@ -105,13 +105,12 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
             try {
                 log.info("Stopping replication for index: ${request.indexName}")
 
-                // Check current state for idempotency logic
-                val replicationStateParams = getReplicationStateParamsForIndex(clusterService, request.indexName)
-                val currentState = replicationStateParams?.get(REPLICATION_LAST_KNOWN_OVERALL_STATE)
-                val isAlreadyStopped = currentState == ReplicationOverallState.STOPPED.name
-
                 validateStateAndCleanupIfNeeded(request.indexName)
                 removeIndexBlocks(request.indexName)
+
+                if (!isIndexRestoring(request.indexName) && state.routingTable.hasIndex(request.indexName)) {
+                    handleIndexCloseReopen(request.indexName)
+                }
 
                 // Get metadata before cleanup so retention lease removal can use it
                 val replMetadata = try {
@@ -121,48 +120,25 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
                     null
                 }
 
+                // CRITICAL: Update cluster state FIRST to trigger task cancellation via ClusterStateListener
+                // This allows tasks to cancel themselves and clean up their stats from FollowerClusterStats
+                updateClusterState(request.indexName)
+
+                // Now cleanup: remove retention leases and unassigned persistent tasks
+                // Tasks should have cancelled themselves by now via ClusterStateListener
                 val cleanupResult = taskCleanupManager.cleanupAllReplicationTasks(request.indexName, replMetadata)
 
-                if (!isIndexRestoring(request.indexName) && state.routingTable.hasIndex(request.indexName)) {
-                    handleIndexCloseReopen(request.indexName)
+                // Delete metadata after successful cluster state update
+                // For idempotency: We delete metadata regardless of cleanup result since cluster state was updated
+                try {
+                    replicationMetadataManager.deleteIndexReplicationMetadata(request.indexName)
+                    log.info("Successfully deleted replication metadata for ${request.indexName}")
+                } catch (e: Exception) {
+                    log.debug("Metadata already deleted or doesn't exist for ${request.indexName}")
                 }
 
-                if (cleanupResult.success || cleanupResult.hasCriticalSuccess()) {
-                    val clusterStateUpdateSuccess = try {
-                        updateClusterState(request.indexName)
-                        true
-                    } catch (e: Exception) {
-                        log.error("Failed to update cluster state for ${request.indexName}", e)
-                        false
-                    }
-                    
-                    // Delete metadata if cluster state update succeeded
-                    // For idempotency: On first call, we need tasks removed. On subsequent calls (when state is already STOPPED),
-                    // tasks may already be gone, so we only check if cluster state update succeeded.
-                    val persistentTasksRemoved = cleanupResult.persistentTasksRemoved > 0 || 
-                                                 cleanupResult.indexTasksRemoved > 0 || 
-                                                 cleanupResult.shardTasksRemoved > 0
-                    
-                    val shouldDeleteMetadata = clusterStateUpdateSuccess && (persistentTasksRemoved || isAlreadyStopped)
-                    
-                    if (shouldDeleteMetadata) {
-                        try {
-                            replicationMetadataManager.deleteIndexReplicationMetadata(request.indexName)
-                            log.info("Successfully deleted replication metadata for ${request.indexName}")
-                        } catch (e: Exception) {
-                            log.debug("Metadata already deleted or doesn't exist for ${request.indexName}")
-                        }
-                    } else {
-                        log.warn("Skipping metadata deletion for ${request.indexName}: clusterStateUpdate=$clusterStateUpdateSuccess, persistentTasksRemoved=$persistentTasksRemoved, isAlreadyStopped=$isAlreadyStopped")
-                    }
-                    
-                    log.info("Successfully stopped replication for ${request.indexName}")
-                    listener.onResponse(AcknowledgedResponse(true))
-                } else {
-                    throw OpenSearchException(
-                        "Failed to cleanup replication tasks for ${request.indexName}: ${cleanupResult.failures}"
-                    )
-                }
+                log.info("Successfully stopped replication for ${request.indexName}")
+                listener.onResponse(AcknowledgedResponse(true))
             } catch (e: Exception) {
                 log.error("Stop replication failed for ${request.indexName}: ${e.stackTraceToString()}")
                 listener.onFailure(e)

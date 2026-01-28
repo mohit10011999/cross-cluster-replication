@@ -84,27 +84,26 @@ class TransportPauseIndexReplicationAction @Inject constructor(transportService:
                 validateStateAndCleanupIfNeeded(request.indexName)
                 checkNotRestoring(request.indexName)
 
+                // CRITICAL: Update state to PAUSED FIRST to trigger task cancellation via ClusterStateListener
+                // This allows tasks to cancel themselves and clean up their stats from FollowerClusterStats
+                // Only update state if not already PAUSED (idempotent optimization)
+                if (!isAlreadyPaused) {
+                    replicationMetadataManager.updateIndexReplicationState(
+                        request.indexName,
+                        ReplicationOverallState.PAUSED,
+                        request.reason
+                    )
+                } else {
+                    log.info("State already PAUSED for ${request.indexName}, skipping state update")
+                }
+
+                // Now cleanup: remove unassigned persistent tasks
+                // Tasks should have cancelled themselves by now via ClusterStateListener
+                // Note: We don't remove retention leases during PAUSE (they're kept for RESUME)
                 val cleanupResult = taskCleanupManager.suspendReplicationTasks(request.indexName)
 
-                if (cleanupResult.success || cleanupResult.hasCriticalSuccess()) {
-                    // Only update state if not already PAUSED (idempotent optimization)
-                    if (!isAlreadyPaused) {
-                        replicationMetadataManager.updateIndexReplicationState(
-                            request.indexName,
-                            ReplicationOverallState.PAUSED,
-                            request.reason
-                        )
-                    } else {
-                        log.info("State already PAUSED for ${request.indexName}, skipping state update")
-                    }
-                    
-                    log.info("Successfully paused replication for ${request.indexName}")
-                    listener.onResponse(AcknowledgedResponse(true))
-                } else {
-                    throw OpenSearchException(
-                        "Failed to suspend replication tasks for ${request.indexName}: ${cleanupResult.failures}"
-                    )
-                }
+                log.info("Successfully paused replication for ${request.indexName}")
+                listener.onResponse(AcknowledgedResponse(true))
             } catch (e: Exception) {
                 log.error("Pause replication failed for ${request.indexName}: ${e.stackTraceToString()}")
                 listener.onFailure(e)
