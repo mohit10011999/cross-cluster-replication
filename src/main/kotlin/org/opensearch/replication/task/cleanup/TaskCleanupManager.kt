@@ -59,7 +59,8 @@ class TaskCleanupManager @Inject constructor(
     private val clusterService: ClusterService,
     private val client: Client,
     private val replicationMetadataManager: ReplicationMetadataManager,
-    private val staleArtifactDetector: StaleArtifactDetector
+    private val staleArtifactDetector: StaleArtifactDetector,
+    private val followerClusterStats: org.opensearch.replication.task.shard.FollowerClusterStats
 ) {
     
     companion object {
@@ -258,8 +259,34 @@ class TaskCleanupManager @Inject constructor(
         override fun newResponse(acknowledged: Boolean) = AcknowledgedResponse(acknowledged)
     }
     
-    private suspend fun removeShardReplicationTasks(indexName: String) = 
-        removeTasksWithRetry(findAllShardReplicationTasks(indexName), CleanupFailure.COMPONENT_SHARD_TASK)
+    private suspend fun removeShardReplicationTasks(indexName: String): TaskRemovalResult {
+        // First, clean up ALL stats for this index immediately
+        // This ensures we remove stats regardless of whether tasks are found or cleanup() is called
+        cleanupAllStatsForIndex(indexName)
+        
+        // Then remove the tasks (which may try to remove stats again in cleanup(), but that's fine)
+        val result = removeTasksWithRetry(findAllShardReplicationTasks(indexName), CleanupFailure.COMPONENT_SHARD_TASK)
+        
+        return result
+    }
+    
+    /**
+     * Removes all stats entries for a given index.
+     * This is a safety measure to ensure no stale stats remain.
+     */
+    private fun cleanupAllStatsForIndex(indexName: String) {
+        val keysToRemove = followerClusterStats.stats.keys.filter { it.indexName == indexName }
+        log.info("Cleaning up stats for index $indexName. Found ${keysToRemove.size} shard stats to remove: $keysToRemove")
+        keysToRemove.forEach { shardId ->
+            val removed = followerClusterStats.stats.remove(shardId)
+            if (removed != null) {
+                log.info("Cleaned up stats for index $indexName, shard: $shardId")
+            } else {
+                log.warn("Failed to remove stats for index $indexName, shard: $shardId (already removed?)")
+            }
+        }
+        log.info("Completed stats cleanup for index $indexName. Remaining total stats: ${followerClusterStats.stats.size}")
+    }
     
     private suspend fun removeIndexReplicationTask(indexName: String) = 
         removeTasksWithRetry(findAllIndexReplicationTasks(indexName), CleanupFailure.COMPONENT_INDEX_TASK)
@@ -277,6 +304,11 @@ class TaskCleanupManager @Inject constructor(
                     persistentTasksService.removeTask(task.id)
                     tasksRemoved++
                     success = true
+                    
+                    // Wait for the task to actually be removed from cluster state
+                    if (component == CleanupFailure.COMPONENT_SHARD_TASK) {
+                        waitForTaskRemoval(task.id)
+                    }
                 } catch (e: Exception) {
                     if (++retryCount < MAX_CLEANUP_RETRIES) {
                         delay(CLEANUP_RETRY_DELAY_MS * retryCount)
@@ -291,6 +323,33 @@ class TaskCleanupManager @Inject constructor(
         
         return TaskRemovalResult(tasksRemoved, failures)
     }
+    
+    /**
+     * Waits for a task to be actually removed from the cluster state.
+     * This ensures the task's cleanup() method will be called.
+     */
+    private suspend fun waitForTaskRemoval(taskId: String) {
+        var attempts = 0
+        val maxAttempts = 50 // 50 * 100ms = 5 seconds
+        
+        while (attempts < maxAttempts) {
+            val allTasks = clusterService.state().metadata.custom<PersistentTasksCustomMetadata>(
+                PersistentTasksCustomMetadata.TYPE
+            )
+            
+            val taskStillExists = allTasks?.getTask(taskId) != null
+            if (!taskStillExists) {
+                log.debug("Task $taskId has been removed from cluster state")
+                return
+            }
+            
+            delay(100)
+            attempts++
+        }
+        
+        log.warn("Task $taskId still present in cluster state after ${maxAttempts * 100}ms")
+    }
+    
     
     private fun findAllShardReplicationTasks(indexName: String) = 
         clusterService.state().metadata.custom<PersistentTasksCustomMetadata>(PersistentTasksCustomMetadata.TYPE)

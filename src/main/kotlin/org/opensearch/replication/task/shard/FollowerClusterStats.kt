@@ -116,5 +116,5 @@ class FollowerShardMetric  {
 
 @Singleton
 class FollowerClusterStats {
-    var stats :MutableMap<ShardId, FollowerShardMetric> =  mutableMapOf()
+    var stats :MutableMap<ShardId, FollowerShardMetric> =  java.util.concurrent.ConcurrentHashMap()
 }
