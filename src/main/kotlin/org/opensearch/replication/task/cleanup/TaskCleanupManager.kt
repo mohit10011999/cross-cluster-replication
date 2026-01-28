@@ -18,11 +18,6 @@ import org.opensearch.replication.action.index.block.UpdateIndexBlockRequest
 import org.opensearch.replication.metadata.ReplicationMetadataManager
 import org.opensearch.replication.metadata.store.ReplicationMetadata
 import org.opensearch.replication.seqno.RemoteClusterRetentionLeaseHelper
-import org.opensearch.replication.task.index.IndexReplicationExecutor
-import org.opensearch.replication.task.index.IndexReplicationParams
-import org.opensearch.replication.task.shard.ShardReplicationExecutor
-import org.opensearch.replication.task.shard.ShardReplicationParams
-import org.opensearch.replication.util.removeTask
 import org.opensearch.replication.util.suspendExecute
 import org.opensearch.replication.util.waitForClusterStateUpdate
 import kotlinx.coroutines.delay
@@ -72,19 +67,19 @@ class TaskCleanupManager @Inject constructor(
         val failures = mutableListOf<CleanupFailure>()
         
         return try {
-            val shardResult = removeShardReplicationTasks(indexName)
-            val indexResult = removeIndexReplicationTask(indexName)
+            // Note: We do NOT explicitly cancel shard/index tasks here.
+            // Tasks will cancel themselves when they detect cluster state changes via ClusterStateListener.
+            // We only clean up unassigned persistent tasks and retention leases.
+            
             val leaseResult = removeRetentionLeases(indexName, replMetadata)
             val persistentResult = removePersistentTasks(indexName)
             
             // Note: We do NOT explicitly clean up stats from FollowerClusterStats here.
             // Stats are cleaned up automatically by ShardReplicationTask.cleanup() when tasks are cancelled.
-            // Explicitly removing stats here causes a race condition where the test sees stale stats
-            // before the tasks have actually been cancelled and cleaned up.
             
-            failures.addAll(shardResult.failures + indexResult.failures + leaseResult.failures + persistentResult.failures)
+            failures.addAll(leaseResult.failures + persistentResult.failures)
             
-            CleanupResult(failures.isEmpty(), indexResult.tasksRemoved, shardResult.tasksRemoved,
+            CleanupResult(failures.isEmpty(), 0, 0,
                 leaseResult.leasesRemoved, persistentResult.tasksRemoved, failures)
         } catch (e: Exception) {
             log.error("Cleanup error for $indexName", e)
@@ -101,18 +96,18 @@ class TaskCleanupManager @Inject constructor(
         val failures = mutableListOf<CleanupFailure>()
         
         return try {
-            val shardResult = removeShardReplicationTasks(indexName)
-            val indexResult = removeIndexReplicationTask(indexName)
+            // Note: We do NOT explicitly cancel shard/index tasks here.
+            // Tasks will cancel themselves when they detect cluster state changes via ClusterStateListener.
+            // We only clean up unassigned persistent tasks.
+            
             val persistentResult = removePersistentTasks(indexName)
             
             // Note: We do NOT explicitly clean up stats from FollowerClusterStats here.
             // Stats are cleaned up automatically by ShardReplicationTask.cleanup() when tasks are cancelled.
-            // Explicitly removing stats here causes a race condition where the test sees stale stats
-            // before the tasks have actually been cancelled and cleaned up.
             
-            failures.addAll(shardResult.failures + indexResult.failures + persistentResult.failures)
+            failures.addAll(persistentResult.failures)
             
-            CleanupResult(failures.isEmpty(), indexResult.tasksRemoved, shardResult.tasksRemoved,
+            CleanupResult(failures.isEmpty(), 0, 0,
                 0, persistentResult.tasksRemoved, failures)
         } catch (e: Exception) {
             log.error("Suspend tasks error for $indexName", e)
@@ -297,52 +292,6 @@ class TaskCleanupManager @Inject constructor(
         override fun newResponse(acknowledged: Boolean) = AcknowledgedResponse(acknowledged)
     }
     
-    private suspend fun removeShardReplicationTasks(indexName: String) = 
-        removeTasksWithRetry(findAllShardReplicationTasks(indexName), CleanupFailure.COMPONENT_SHARD_TASK)
-    
-    private suspend fun removeIndexReplicationTask(indexName: String) = 
-        removeTasksWithRetry(findAllIndexReplicationTasks(indexName), CleanupFailure.COMPONENT_INDEX_TASK)
-    
-    private suspend fun removeTasksWithRetry(tasks: List<PersistentTask<*>>, component: String): TaskRemovalResult {
-        val failures = mutableListOf<CleanupFailure>()
-        var tasksRemoved = 0
-        
-        tasks.forEach { task ->
-            var retryCount = 0
-            var success = false
-            
-            while (retryCount < MAX_CLEANUP_RETRIES && !success) {
-                try {
-                    persistentTasksService.removeTask(task.id)
-                    tasksRemoved++
-                    success = true
-                } catch (e: Exception) {
-                    if (++retryCount < MAX_CLEANUP_RETRIES) {
-                        delay(CLEANUP_RETRY_DELAY_MS * retryCount)
-                    } else {
-                        val failure = createCleanupFailure(component, task.id, e)
-                        failures.add(failure)
-                        if (handleCleanupFailure(failure) == RecoveryAction.FAIL_OPERATION) throw e
-                    }
-                }
-            }
-        }
-        
-        return TaskRemovalResult(tasksRemoved, failures)
-    }
-    
-    private fun findAllShardReplicationTasks(indexName: String) = 
-        clusterService.state().metadata.custom<PersistentTasksCustomMetadata>(PersistentTasksCustomMetadata.TYPE)
-            ?.findTasks(ShardReplicationExecutor.TASK_NAME, Predicate { true })
-            ?.filterIsInstance<PersistentTask<ShardReplicationParams>>()
-            ?.filter { it.params?.followerShardId?.indexName == indexName } ?: emptyList()
-    
-    private fun findAllIndexReplicationTasks(indexName: String) = 
-        clusterService.state().metadata.custom<PersistentTasksCustomMetadata>(PersistentTasksCustomMetadata.TYPE)
-            ?.findTasks(IndexReplicationExecutor.TASK_NAME, Predicate { true })
-            ?.filterIsInstance<PersistentTask<IndexReplicationParams>>()
-            ?.filter { it.params?.followerIndexName == indexName } ?: emptyList()
-    
     private fun handleCleanupFailure(failure: CleanupFailure) = when {
         failure.error.contains("task not found") || failure.error.contains("RetentionLeaseNotFoundException") ||
         failure.error.contains("no such index") -> RecoveryAction.LOG_AND_CONTINUE
@@ -373,9 +322,7 @@ data class CleanupResult(
     val retentionLeasesRemoved: Int,
     val persistentTasksRemoved: Int,
     val failures: List<CleanupFailure>
-) {
-    fun hasCriticalSuccess() = indexTasksRemoved > 0 || shardTasksRemoved > 0
-}
+)
 
 data class RetentionLeaseCleanupResult(val leasesRemoved: Int, val failures: List<CleanupFailure>) {
     val success get() = failures.isEmpty()
@@ -394,8 +341,6 @@ data class CleanupFailure(val component: String, val taskId: String?, val error:
         const val COMPONENT_CLEANUP_MANAGER = "cleanup-manager"
     }
 }
-
-internal data class TaskRemovalResult(val tasksRemoved: Int, val failures: List<CleanupFailure>)
 
 data class StaleArtifactCleanupResult(
     val indexName: String,
