@@ -189,7 +189,12 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
             } catch (e: Exception) {
                 log.warn("Stale artifact cleanup failed for $indexName", e)
             }
+            // After cleaning up stale artifacts, continue with stop operation
+            return
         }
+        
+        // No replication state and no stale artifacts - this is an error
+        throw IllegalArgumentException("No replication in progress for index:$indexName")
     }
 
     /**
