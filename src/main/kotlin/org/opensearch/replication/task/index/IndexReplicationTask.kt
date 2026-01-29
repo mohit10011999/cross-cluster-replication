@@ -236,6 +236,7 @@ open class IndexReplicationTask(id: Long, type: String, action: String, descript
                                    if (replicationSettings.replicateIndexDeletion
                                        && state.errorMsg.contains("org.opensearch.index.IndexNotFoundException - \"no such index ["
                                                + leaderIndex.name + "]\"")) {
+                                       log.info("Auto-delete: Detected leader index deletion for $followerIndexName, setting isLeaderIndexDeleted=true")
                                        isLeaderIndexDeleted = true
                                        stopReplication(state)
                                     } else {
@@ -810,25 +811,30 @@ open class IndexReplicationTask(id: Long, type: String, action: String, descript
         // Currently, we don't have view on the cancellation reason. Before triggering
         // any further actions on the index from this task, verify that, this is the actual task tracking the index.
         // - stale task during cancellation shouldn't trigger further actions.
-        if(isTrackingTaskForIndex()) {
-            if (currentTaskState.state == ReplicationState.RESTORING)  {
-                log.info("Replication stopped before restore could finish, so removing partial restore..")
-                cancelRestore()
-            }
+        withContext(NonCancellable) {
+            if(isTrackingTaskForIndex()) {
+                if (currentTaskState.state == ReplicationState.RESTORING)  {
+                    log.info("Replication stopped before restore could finish, so removing partial restore..")
+                    cancelRestore()
+                }
 
-            // if cancelled and not in paused state.
-            val replicationStateParams = getReplicationStateParamsForIndex(clusterService, followerIndexName)
-            if(isCancelled && replicationStateParams != null
-                    && replicationStateParams[REPLICATION_LAST_KNOWN_OVERALL_STATE] == ReplicationOverallState.RUNNING.name) {
-                log.info("Task is cancelled. Moving the index to auto-pause state")
-                client.execute(PauseIndexReplicationAction.INSTANCE,
-                        PauseIndexReplicationRequest(followerIndexName, TASK_CANCELLATION_REASON))
-            }
+                // if cancelled and not in paused state.
+                val replicationStateParams = getReplicationStateParamsForIndex(clusterService, followerIndexName)
+                if(isCancelled && replicationStateParams != null
+                        && replicationStateParams[REPLICATION_LAST_KNOWN_OVERALL_STATE] == ReplicationOverallState.RUNNING.name) {
+                    log.info("Task is cancelled. Moving the index to auto-pause state")
+                    client.execute(PauseIndexReplicationAction.INSTANCE,
+                            PauseIndexReplicationRequest(followerIndexName, TASK_CANCELLATION_REASON))
+                }
 
-            // Deleting the follower index if replication is stopped because of leader index deletion
-            if (clusterService.clusterSettings.get(ReplicationPlugin.REPLICATION_REPLICATE_INDEX_DELETION)
-                && currentTaskState.state == ReplicationState.COMPLETED && isLeaderIndexDeleted)  {
-                deleteIndex()
+                // Deleting the follower index if replication is stopped because of leader index deletion
+                // Check isCancelled OR COMPLETED state since task might be cancelled during state transition
+                if (clusterService.clusterSettings.get(ReplicationPlugin.REPLICATION_REPLICATE_INDEX_DELETION)
+                    && (currentTaskState.state == ReplicationState.COMPLETED || isCancelled) 
+                    && isLeaderIndexDeleted)  {
+                    log.info("Auto-delete: Deleting follower index $followerIndexName (state=${currentTaskState.state}, isCancelled=$isCancelled, isLeaderIndexDeleted=$isLeaderIndexDeleted)")
+                    deleteIndex()
+                }
             }
         }
 

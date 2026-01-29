@@ -130,14 +130,13 @@ class TaskCleanupManager @Inject constructor(
             
             retentionLeaseHelper.attemptRemoveRetentionLease(clusterService, replMetadata, indexName)
             leasesRemoved = 1
-        } catch (e: Throwable) {
+        } catch (e: Exception) {
             // Log and continue - retention lease removal failure should not block STOP operation
             // This handles cases where:
             // - Leader cluster is unavailable
             // - Leader cluster is removed from settings
             // - Network issues prevent communication
             // - Leader index validation fails
-            // Using Throwable to catch ALL exceptions including runtime errors
             log.warn("Failed to remove retention lease for $indexName: ${e.message}", e)
         }
         
