@@ -122,12 +122,12 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
                     null
                 }
 
-                // CRITICAL: Update cluster state FIRST to trigger task cancellation via ClusterStateListener
-                // This allows tasks to cancel themselves and clean up their stats from FollowerClusterStats
+                // CRITICAL: Update cluster state FIRST (removes blocks/settings)
+                // This prepares the index for cleanup operations
                 updateClusterState(request.indexName)
 
                 // Now cleanup: remove retention leases and unassigned persistent tasks
-                // Tasks should have cancelled themselves by now via ClusterStateListener
+                // Note: Tasks will cancel themselves when we remove ReplicationStateMetadata below
                 val cleanupResult = taskCleanupManager.cleanupAllReplicationTasks(request.indexName, replMetadata)
 
                 // Reopen index AFTER cluster state update (so blocks/settings are removed)
@@ -135,18 +135,27 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
                     reopenIndex(request.indexName)
                 }
 
-                // Delete metadata ONLY after successful cleanup
-                // This ensures we can retry cleanup if it fails, using the metadata for leader cluster info
+                // CONDITIONAL metadata deletion based on cleanup result
+                // This enables both idempotent retry AND auto-delete functionality
                 if (cleanupResult.success) {
+                    // Full cleanup succeeded - safe to delete metadata completely
                     try {
                         replicationMetadataManager.deleteIndexReplicationMetadata(request.indexName)
                         log.info("Successfully deleted replication metadata for ${request.indexName}")
                     } catch (e: Exception) {
-                        log.debug("Metadata already deleted or doesn't exist for ${request.indexName}")
+                        log.debug("Metadata already deleted for ${request.indexName}")
                     }
                 } else {
-                    log.warn("Cleanup had failures for ${request.indexName}, keeping metadata for retry. Failures: ${cleanupResult.failures}")
-                    // Still return success since cluster state was updated and index is stopped
+                    // Cleanup had failures - keep metadata store for retry BUT remove ReplicationStateMetadata
+                    // to trigger task cancellation for consistency
+                    log.warn("Cleanup had failures for ${request.indexName}, keeping metadata store for retry. Failures: ${cleanupResult.failures}")
+                    try {
+                        replicationMetadataManager.removeReplicationStateOnly(request.indexName)
+                        log.info("Removed replication state metadata for ${request.indexName} to trigger task cancellation")
+                    } catch (e: Exception) {
+                        log.warn("Failed to remove replication state for ${request.indexName}", e)
+                    }
+                    // Still return success since cluster state was updated and index is stopped from user perspective
                     // Metadata will be cleaned up on next STOP call (idempotent)
                 }
 
