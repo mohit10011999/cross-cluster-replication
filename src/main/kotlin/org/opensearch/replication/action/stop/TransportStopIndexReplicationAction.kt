@@ -108,8 +108,10 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
                 validateStateAndCleanupIfNeeded(request.indexName)
                 removeIndexBlocks(request.indexName)
 
-                if (!isIndexRestoring(request.indexName) && state.routingTable.hasIndex(request.indexName)) {
-                    handleIndexCloseReopen(request.indexName)
+                // Close index BEFORE cluster state update (if not restoring)
+                val shouldReopenIndex = !isIndexRestoring(request.indexName) && state.routingTable.hasIndex(request.indexName)
+                if (shouldReopenIndex) {
+                    closeIndex(request.indexName)
                 }
 
                 // Get metadata before cleanup so retention lease removal can use it
@@ -128,13 +130,24 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
                 // Tasks should have cancelled themselves by now via ClusterStateListener
                 val cleanupResult = taskCleanupManager.cleanupAllReplicationTasks(request.indexName, replMetadata)
 
-                // Delete metadata after successful cluster state update
-                // For idempotency: We delete metadata regardless of cleanup result since cluster state was updated
-                try {
-                    replicationMetadataManager.deleteIndexReplicationMetadata(request.indexName)
-                    log.info("Successfully deleted replication metadata for ${request.indexName}")
-                } catch (e: Exception) {
-                    log.debug("Metadata already deleted or doesn't exist for ${request.indexName}")
+                // Reopen index AFTER cluster state update (so blocks/settings are removed)
+                if (shouldReopenIndex) {
+                    reopenIndex(request.indexName)
+                }
+
+                // Delete metadata ONLY after successful cleanup
+                // This ensures we can retry cleanup if it fails, using the metadata for leader cluster info
+                if (cleanupResult.success) {
+                    try {
+                        replicationMetadataManager.deleteIndexReplicationMetadata(request.indexName)
+                        log.info("Successfully deleted replication metadata for ${request.indexName}")
+                    } catch (e: Exception) {
+                        log.debug("Metadata already deleted or doesn't exist for ${request.indexName}")
+                    }
+                } else {
+                    log.warn("Cleanup had failures for ${request.indexName}, keeping metadata for retry. Failures: ${cleanupResult.failures}")
+                    // Still return success since cluster state was updated and index is stopped
+                    // Metadata will be cleaned up on next STOP call (idempotent)
                 }
 
                 log.info("Successfully stopped replication for ${request.indexName}")
@@ -178,6 +191,7 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
 
     /**
      * Handles case where no replication state exists but stale artifacts might remain.
+     * Implements idempotent behavior while still validating that the index exists.
      */
     private suspend fun handleMissingReplicationState(indexName: String) {
         val artifactReport = staleArtifactDetector.detectStaleArtifacts(indexName)
@@ -193,8 +207,22 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
             return
         }
         
-        // No replication state and no stale artifacts - this is an error
-        throw IllegalArgumentException("No replication in progress for index:$indexName")
+        // No replication state and no stale artifacts
+        // Check if the index exists at all
+        val indexExists = clusterService.state().metadata.hasIndex(indexName)
+        
+        if (!indexExists) {
+            // Index doesn't exist - this is an error (user called STOP on non-existent index)
+            throw IllegalArgumentException("No replication in progress for index:$indexName")
+        }
+        
+        // Index exists but is not being replicated
+        // This could mean:
+        // 1. STOP called on wrong cluster (e.g., leader instead of follower) - OK for auto-delete
+        // 2. Replication already stopped (idempotent call) - OK
+        // 3. Index was never replicated - OK
+        // In all cases, succeed gracefully
+        log.info("Index $indexName exists but is not being replicated - nothing to stop")
     }
 
     /**
@@ -223,9 +251,9 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
     }
 
     /**
-     * Handles index close and reopen operations during stop.
+     * Closes the index before cluster state update.
      */
-    private suspend fun handleIndexCloseReopen(indexName: String) {
+    private suspend fun closeIndex(indexName: String) {
         try {
             val updateRequest = UpdateMetadataRequest(
                 indexName,
@@ -241,7 +269,17 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
             if (!closeResponse.isAcknowledged) {
                 throw OpenSearchException("Unable to close index: $indexName")
             }
+        } catch (e: Exception) {
+            log.error("Failed to close index $indexName", e)
+            throw e
+        }
+    }
 
+    /**
+     * Reopens the index after cluster state update (blocks/settings removed).
+     */
+    private suspend fun reopenIndex(indexName: String) {
+        try {
             val reopenResponse = client.suspending(
                 client.admin().indices()::open,
                 injectSecurityContext = true
@@ -251,7 +289,7 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
                 throw OpenSearchException("Failed to reopen index: $indexName")
             }
         } catch (e: Exception) {
-            log.error("Failed to handle index close/reopen for $indexName", e)
+            log.error("Failed to reopen index $indexName", e)
             throw e
         }
     }
