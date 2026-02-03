@@ -170,10 +170,40 @@ class TransportReplicateIndexAction @Inject constructor(transportService: Transp
     }
 
     /**
-     * Validates no conflicting stale tasks exist before starting replication.
-     * Automatically cleans up all stale artifacts if detected.
+     * This method distinguishes between active replication (RUNNING/PAUSED state)
+     * and truly stale artifacts from failed operations. Active replication will cause this
+     * method to throw an error instead of attempting cleanup.
      */
     private suspend fun performPreOperationValidation(followerIndex: String) {
+        // If the follower index already exists, skip this validation
+        // The index existence check in TransportReplicateIndexClusterManagerNodeAction will handle it
+        if (clusterService.state().metadata().hasIndex(followerIndex)) {
+            return
+        }
+        
+        // First check if replication is already active for this index
+        val replicationStateParams = org.opensearch.replication.metadata.state.getReplicationStateParamsForIndex(
+            clusterService, 
+            followerIndex
+        )
+        
+        if (replicationStateParams != null) {
+            val currentState = replicationStateParams[org.opensearch.replication.metadata.state.REPLICATION_LAST_KNOWN_OVERALL_STATE]
+            
+            // If replication is RUNNING or PAUSED, it's active - don't cleanup, throw error
+            if (currentState == org.opensearch.replication.metadata.ReplicationOverallState.RUNNING.name || 
+                currentState == org.opensearch.replication.metadata.ReplicationOverallState.PAUSED.name) {
+                throw IllegalStateException(
+                    "Replication is already active for index $followerIndex in $currentState state. " +
+                    "Cannot start replication again. Use resume API to restart paused replication."
+                )
+            }
+            
+            // If state is STOPPED or FAILED, artifacts are stale and should be cleaned up
+            log.info("Found replication metadata for $followerIndex in $currentState state - will cleanup stale artifacts")
+        }
+        
+        // Now safe to detect and cleanup truly stale artifacts
         val staleArtifactReport = staleArtifactDetector.detectStaleArtifacts(followerIndex)
         
         if (!staleArtifactReport.hasStaleArtifacts) return
