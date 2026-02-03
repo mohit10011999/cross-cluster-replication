@@ -134,32 +134,54 @@ class StaleArtifactDetector @Inject constructor(
         task: PersistentTasksCustomMetadata.PersistentTask<*>,
         indexName: String
     ): Boolean {
-        return task.id.startsWith("replication:") &&
-                (task.id == "replication:index:$indexName" || 
-                 task.id.split(":").getOrNull(1)?.contains(indexName) == true)
+        if (!task.id.startsWith("replication:")) {
+            return false
+        }
+        
+        // Index replication task format: replication:index:indexName
+        if (task.id == "replication:index:$indexName") {
+            return true
+        }
+        
+        // Shard replication task format: replication:[indexName][shardId]
+        // Example: replication:[index1][0]
+        // We need to extract the index name between the first '[' and ']'
+        val parts = task.id.split(":")
+        if (parts.size >= 2) {
+            val shardPart = parts[1]
+            // Extract index name from [indexName][shardId] format
+            if (shardPart.startsWith("[")) {
+                val firstCloseBracket = shardPart.indexOf(']')
+                if (firstCloseBracket > 1) {
+                    val extractedIndexName = shardPart.substring(1, firstCloseBracket)
+                    return extractedIndexName == indexName
+                }
+            }
+        }
+        
+        return false
     }
 
     private fun extractIndexNameFromReplicationTask(
         task: PersistentTasksCustomMetadata.PersistentTask<*>
     ): String? {
-        if (!task.id.startsWith("replication:")) {
-            return null
-        }
+        // Task ID formats:
+        // 1. Index task: replication:index:indexName
+        // 2. Shard task: replication:[indexName][shardId]
         
-        val parts = task.id.split(":")
-        return when {
-            parts.size >= 3 && parts[1] == "index" -> parts[2] // replication:index:indexName
-            parts.size >= 2 -> {
-                // replication:[indexName][shardId] format
-                val indexPart = parts[1]
-                val bracketIndex = indexPart.indexOf('[')
-                if (bracketIndex > 0) {
-                    indexPart.substring(0, bracketIndex)
-                } else {
-                    indexPart
-                }
-            }
-            else -> null
+        // Regex pattern explanation:
+        // ^replication:           - Must start with "replication:"
+        // (?:                     - Non-capturing group for alternatives
+        //   index:(.+)            - Match "index:" followed by index name (group 1)
+        //   |                     - OR
+        //   \[([^\]]+)\]          - Match "[indexName]" - capture text between brackets (group 2)
+        // )
+        val pattern = Regex("^replication:(?:index:(.+)|\\[([^\\]]+)\\])")
+        val matchResult = pattern.find(task.id)
+        
+        return matchResult?.let {
+            // Group 1 is for index task format, Group 2 is for shard task format
+            it.groupValues[1].ifEmpty { it.groupValues[2] }
         }
     }
 }

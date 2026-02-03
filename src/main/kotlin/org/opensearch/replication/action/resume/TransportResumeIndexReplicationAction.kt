@@ -126,22 +126,29 @@ class TransportResumeIndexReplicationAction @Inject constructor(transportService
         }
     }
 
-    private suspend fun isResumable(params: IndexReplicationParams): Boolean {
+    private suspend fun isResumable(params :IndexReplicationParams): Boolean {
+        var isResumable = true
         val remoteClient = client.getRemoteClusterClient(params.leaderAlias)
-        val shards = clusterService.state().routingTable.indicesRouting().get(params.followerIndexName)?.shards() ?: return false
+        val shards = clusterService.state().routingTable.indicesRouting().get(params.followerIndexName)?.shards()
         val retentionLeaseHelper = RemoteClusterRetentionLeaseHelper(clusterService.clusterName.value(), clusterService.state().metadata.clusterUUID(), remoteClient)
         
-        val allLeasesExist = shards.all { 
+        shards?.forEach {
             val followerShardId = it.value.shardId
-            retentionLeaseHelper.verifyRetentionLeaseExist(ShardId(params.leaderIndex, followerShardId.id), followerShardId)
+
+            if  (!retentionLeaseHelper.verifyRetentionLeaseExist(ShardId(params.leaderIndex, followerShardId.id), followerShardId)) {
+                isResumable = false
+            }
         }
 
-        if (allLeasesExist) return true
+        if (isResumable) {
+            return true
+        }
 
         // clean up all retention leases we may have accidentally took while doing verifyRetentionLeaseExist .
         // Idempotent Op which does no harm
-        shards.forEach {
+        shards?.forEach {
             val followerShardId = it.value.shardId
+            log.debug("Removing lease for $followerShardId.id ")
             retentionLeaseHelper.attemptRetentionLeaseRemoval(ShardId(params.leaderIndex, followerShardId.id), followerShardId)
         }
 
