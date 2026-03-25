@@ -100,7 +100,16 @@ class TransportReplicateIndexClusterManagerNodeAction @Inject constructor(transp
                     throw OpenSearchStatusException("[FORBIDDEN] Replication START block is set", RestStatus.FORBIDDEN)
                 }
 
-                // Validate no active replication metadata exists before any cluster state modifications
+                log.debug("Making request to get metadata of ${replicateIndexReq.leaderIndex} index on remote cluster")
+                val remoteMetadata = getRemoteIndexMetadata(replicateIndexReq.leaderAlias, replicateIndexReq.leaderIndex)
+                log.debug("Response returned of the request made to get metadata of ${replicateIndexReq.leaderIndex} index on remote cluster")
+
+                if (state.routingTable.hasIndex(replicateIndexReq.followerIndex)) {
+                    throw IllegalArgumentException("Cant use same index again for replication. " +
+                    "Delete the index:${replicateIndexReq.followerIndex}")
+                }
+
+                // Validate no active replication metadata exists before creating new tasks
                 validateNoActiveMetadata(replicateIndexReq.followerIndex)
 
                 // Check for and remove stale tasks before creating new ones
@@ -108,10 +117,6 @@ class TransportReplicateIndexClusterManagerNodeAction @Inject constructor(transp
                 if (staleTaskCount > 0) {
                     log.info("Cleaned up $staleTaskCount stale tasks for ${replicateIndexReq.followerIndex}")
                 }
-
-                log.debug("Making request to get metadata of ${replicateIndexReq.leaderIndex} index on remote cluster")
-                val remoteMetadata = getRemoteIndexMetadata(replicateIndexReq.leaderAlias, replicateIndexReq.leaderIndex)
-                log.debug("Response returned of the request made to get metadata of ${replicateIndexReq.leaderIndex} index on remote cluster")
 
                 if (state.routingTable.hasIndex(replicateIndexReq.followerIndex)) {
                     throw IllegalArgumentException("Cant use same index again for replication. " +

@@ -180,10 +180,8 @@ class StopReplicationIT: MultiClusterRestTestCase() {
 
     fun `test stop without replication in progress`() {
         val followerClient = getClientForCluster(FOLLOWER)
-        assertThatThrownBy {
-            followerClient.stopReplication("no_index")
-        }.isInstanceOf(ResponseException::class.java)
-                .hasMessageContaining("No replication in progress for index:no_index")
+        // Idempotent stop - should succeed even without active replication
+        followerClient.stopReplication("no_index")
     }
 
     fun `test stop replication when leader cluster is unavailable`() {
@@ -319,10 +317,8 @@ class StopReplicationIT: MultiClusterRestTestCase() {
         assertBusy {
             assertThat(leaderClient.indices().exists(GetIndexRequest("restored-$followerIndexName"), RequestOptions.DEFAULT)).isEqualTo(true)
         }
-        // Invoke stop on the new leader cluster index
-        assertThatThrownBy { leaderClient.stopReplication("restored-$followerIndexName") }
-                .isInstanceOf(ResponseException::class.java)
-                .hasMessageContaining("Metadata for restored-$followerIndexName doesn't exist")
+        // Invoke stop on the new leader cluster index - idempotent, should succeed
+        leaderClient.stopReplication("restored-$followerIndexName")
         // Start replication on the new leader index
         followerClient.startReplication(
                 StartReplicationRequest("source", "restored-$followerIndexName", "restored-$followerIndexName"),
