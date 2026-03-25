@@ -13,10 +13,13 @@ package org.opensearch.replication.action.index
 
 import org.opensearch.replication.metadata.ReplicationMetadataManager
 import org.opensearch.replication.metadata.ReplicationOverallState
+import org.opensearch.replication.metadata.state.REPLICATION_LAST_KNOWN_OVERALL_STATE
+import org.opensearch.replication.metadata.state.getReplicationStateParamsForIndex
 import org.opensearch.replication.task.ReplicationState
 import org.opensearch.replication.task.index.IndexReplicationExecutor
 import org.opensearch.replication.task.index.IndexReplicationParams
 import org.opensearch.replication.task.index.IndexReplicationState
+import org.opensearch.replication.util.StaleTaskUtils
 import org.opensearch.replication.util.coroutineContext
 import org.opensearch.replication.util.startTask
 import org.opensearch.replication.util.suspending
@@ -97,6 +100,15 @@ class TransportReplicateIndexClusterManagerNodeAction @Inject constructor(transp
                     throw OpenSearchStatusException("[FORBIDDEN] Replication START block is set", RestStatus.FORBIDDEN)
                 }
 
+                // Validate no active replication metadata exists before any cluster state modifications
+                validateNoActiveMetadata(replicateIndexReq.followerIndex)
+
+                // Check for and remove stale tasks before creating new ones
+                val staleTaskCount = StaleTaskUtils.removeStaleTasksForIndex(clusterService, nodeClient, replicateIndexReq.followerIndex)
+                if (staleTaskCount > 0) {
+                    log.info("Cleaned up $staleTaskCount stale tasks for ${replicateIndexReq.followerIndex}")
+                }
+
                 log.debug("Making request to get metadata of ${replicateIndexReq.leaderIndex} index on remote cluster")
                 val remoteMetadata = getRemoteIndexMetadata(replicateIndexReq.leaderAlias, replicateIndexReq.leaderIndex)
                 log.debug("Response returned of the request made to get metadata of ${replicateIndexReq.leaderIndex} index on remote cluster")
@@ -139,6 +151,28 @@ class TransportReplicateIndexClusterManagerNodeAction @Inject constructor(transp
                 log.error("Failed to trigger replication for ${replicateIndexReq.followerIndex} - ${e.stackTraceToString()}")
                 listener.onFailure(e)
             }
+        }
+    }
+
+    private suspend fun validateNoActiveMetadata(indexName: String) {
+        val replicationStateParams = getReplicationStateParamsForIndex(clusterService, indexName)
+
+        if (replicationStateParams != null) {
+            val currentState = replicationStateParams[REPLICATION_LAST_KNOWN_OVERALL_STATE]
+
+            if (currentState == ReplicationOverallState.RUNNING.name ||
+                currentState == ReplicationOverallState.PAUSED.name) {
+                throw IllegalStateException(
+                    "Replication is already active for index $indexName in $currentState state. " +
+                    "Cannot start replication again. Use resume API to restart paused replication."
+                )
+            }
+
+            // STOPPED or FAILED state indicates stale metadata
+            throw IllegalStateException(
+                "Stale replication metadata exists for index $indexName. " +
+                "Please run the Stop Replication API to clean up before starting replication."
+            )
         }
     }
 
