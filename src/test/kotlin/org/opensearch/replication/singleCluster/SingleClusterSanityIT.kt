@@ -82,10 +82,8 @@ class SingleClusterSanityIT : MultiClusterRestTestCase() {
                 waitForRestore = true
             )
         }.isInstanceOf(ResponseException::class.java).hasMessageContaining("no such remote cluster")
-        assertThatThrownBy {
-            follower.stopReplication(followerClusterName)
-        }.isInstanceOf(ResponseException::class.java)
-            .hasMessageContaining("No replication in progress for index:"+followerClusterName)
+        // Idempotent stop - should succeed even without active replication
+        follower.stopReplication(followerClusterName)
     }
 
 }
