@@ -331,4 +331,50 @@ class StopReplicationIT: MultiClusterRestTestCase() {
             assertThat(followerClient.getShardReplicationTasks("restored-$followerIndexName")).isNotEmpty()
         }, 60, TimeUnit.SECONDS)
     }
+
+    fun `test idempotent stop replication can be called multiple times`() {
+        val followerClient = getClientForCluster(FOLLOWER)
+        val leaderClient = getClientForCluster(LEADER)
+        createConnectionBetweenClusters(FOLLOWER, LEADER)
+        val createIndexResponse = leaderClient.indices().create(CreateIndexRequest(leaderIndexName), RequestOptions.DEFAULT)
+        assertThat(createIndexResponse.isAcknowledged).isTrue()
+        followerClient.startReplication(
+            StartReplicationRequest("source", leaderIndexName, followerIndexName),
+            waitForRestore = true
+        )
+        // First stop should succeed
+        followerClient.stopReplication(followerIndexName)
+        // Second stop should also succeed (idempotent)
+        followerClient.stopReplication(followerIndexName)
+    }
+
+    fun `test stop replication cleans up and allows restart`() {
+        val followerClient = getClientForCluster(FOLLOWER)
+        val leaderClient = getClientForCluster(LEADER)
+        createConnectionBetweenClusters(FOLLOWER, LEADER)
+        val createIndexResponse = leaderClient.indices().create(CreateIndexRequest(leaderIndexName), RequestOptions.DEFAULT)
+        assertThat(createIndexResponse.isAcknowledged).isTrue()
+        followerClient.startReplication(
+            StartReplicationRequest("source", leaderIndexName, followerIndexName),
+            waitForRestore = true
+        )
+        val sourceMap = mapOf("name" to randomAlphaOfLength(5))
+        leaderClient.index(IndexRequest(leaderIndexName).id("1").source(sourceMap), RequestOptions.DEFAULT)
+        assertBusy {
+            assertThat(followerClient.indices().exists(GetIndexRequest(followerIndexName), RequestOptions.DEFAULT)).isTrue()
+        }
+        // Stop replication
+        followerClient.stopReplication(followerIndexName)
+        // Verify follower index is still accessible (unblocked) after stop
+        followerClient.index(IndexRequest(followerIndexName).id("2").source(sourceMap), RequestOptions.DEFAULT)
+        // Delete follower index and restart replication
+        followerClient.indices().delete(DeleteIndexRequest(followerIndexName), RequestOptions.DEFAULT)
+        followerClient.startReplication(
+            StartReplicationRequest("source", leaderIndexName, followerIndexName),
+            waitForRestore = true
+        )
+        assertBusy {
+            assertThat(followerClient.indices().exists(GetIndexRequest(followerIndexName), RequestOptions.DEFAULT)).isTrue()
+        }
+    }
 }
