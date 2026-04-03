@@ -29,7 +29,6 @@ import org.opensearch.replication.util.coroutineContext
 import org.opensearch.replication.util.suspendExecute
 import org.opensearch.replication.util.suspending
 import org.opensearch.replication.util.waitForClusterStateUpdate
-import org.opensearch.replication.util.StaleTaskUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
@@ -57,6 +56,8 @@ import org.opensearch.common.inject.Inject
 import org.opensearch.core.common.io.stream.StreamInput
 import org.opensearch.common.settings.Settings
 import org.opensearch.replication.util.stackTraceToString
+import org.opensearch.persistent.PersistentTasksCustomMetadata
+import org.opensearch.persistent.RemovePersistentTaskAction
 import org.opensearch.threadpool.ThreadPool
 import org.opensearch.transport.TransportService
 import java.io.IOException
@@ -159,12 +160,11 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
                     }
                 }
 
-                // Remove stale persistent tasks using StaleTaskUtils (idempotent)
+                // Remove ALL persistent replication tasks (assigned + unassigned) after cluster
+                // state update. Removes all tasks regardless of assignment state to avoid a race
+                // where tasks are still "assigned" (markAsCompleted hasn't landed yet) but dying.
                 try {
-                    val tasksRemoved = StaleTaskUtils.removeStaleTasksForIndex(clusterService, client, request.indexName)
-                    if (tasksRemoved > 0) {
-                        log.info("Removed $tasksRemoved stale persistent task(s) for ${request.indexName}")
-                    }
+                    removeStaleReplicationTasksFromClusterState(request)
                 } catch (e: Exception) {
                     log.warn("Failed to remove persistent tasks for ${request.indexName}: ${e.message}", e)
                 }
@@ -183,6 +183,31 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
             }
         }
     }
+
+    private suspend fun removeStaleReplicationTasksFromClusterState(request: StopIndexReplicationRequest) {
+        try {
+            val allTasks: PersistentTasksCustomMetadata =
+                clusterService.state().metadata().custom(PersistentTasksCustomMetadata.TYPE)
+            for (singleTask in allTasks.tasks()) {
+                if (isReplicationTask(singleTask, request)) {
+                    log.info("Removing task: ${singleTask.id} from cluster state")
+                    val removeRequest: RemovePersistentTaskAction.Request =
+                        RemovePersistentTaskAction.Request(singleTask.id)
+                    client.suspendExecute(RemovePersistentTaskAction.INSTANCE, removeRequest)
+                }
+            }
+        } catch (e: Exception) {
+            log.info("Could not update cluster state")
+        }
+    }
+
+    // Remove index replication task metadata, format replication:index:fruit-1
+    // Remove shard replication task metadata, format replication:[fruit-1][0]
+    private fun isReplicationTask(
+        singleTask: PersistentTasksCustomMetadata.PersistentTask<*>,
+        request: StopIndexReplicationRequest
+    ) = singleTask.id.startsWith("replication:") &&
+            (singleTask.id == "replication:index:${request.indexName}" || singleTask.id.split(":")[1].contains(request.indexName))
 
     override fun executor(): String {
         return ThreadPool.Names.SAME

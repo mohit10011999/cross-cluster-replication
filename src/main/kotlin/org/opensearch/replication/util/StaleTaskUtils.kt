@@ -40,13 +40,6 @@ object StaleTaskUtils {
 
     /**
      * Finds all unassigned persistent replication tasks associated with the given index name.
-     * Only returns tasks that are NOT currently assigned to a node, i.e. truly stale tasks.
-     * Assigned tasks are actively running and should not be removed.
-     * Searches the cluster state for persistent tasks whose IDs match either:
-     * - Index task format: "replication:index:{indexName}"
-     * - Shard task format: "replication:[{indexName}][{shardId}]"
-     * @param clusterService the cluster service to read cluster state from
-     * @param indexName the target index name to match against task IDs
      * @return list of unassigned persistent tasks matching the index name, empty if none found
      */
     fun findStaleTasksForIndex(
@@ -82,8 +75,6 @@ object StaleTaskUtils {
      * Removes all stale replication tasks for the given index from the cluster state.
      * This operation is idempotent — if tasks have already been removed, the operation
      * succeeds silently. Each task removal is logged individually.
-     * @param clusterService the cluster service to read cluster state from
-     * @param client the client to execute remove task actions
      * @return the number of tasks successfully removed
      * @throws IllegalStateException if a task removal fails (non-idempotent failure)
      */
