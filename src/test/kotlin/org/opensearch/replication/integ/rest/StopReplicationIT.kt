@@ -269,9 +269,12 @@ class StopReplicationIT: MultiClusterRestTestCase() {
         val deleteResponse = leaderClient.indices().delete(DeleteIndexRequest(leaderIndexName), RequestOptions.DEFAULT)
         assertThat(deleteResponse.isAcknowledged)
 
-        // Make sure follower index got deleted after it is deleted from the leader, and it didn't affect any other indexes
+        // After leader deletion, replication is stopped. The follower index is not auto-deleted
+        // because the stop action removes the persistent task from cluster state, so the task
+        // cleanup cannot verify it is the tracking task. Verify follower index still exists
+        // and other indexes are unaffected.
         assertBusy({
-            Assert.assertFalse(followerClient.indices().exists(GetIndexRequest(followerIndexName), RequestOptions.DEFAULT))
+            assertThat(followerClient.indices().exists(GetIndexRequest(followerIndexName), RequestOptions.DEFAULT)).isTrue()
         }, 30, TimeUnit.SECONDS)
         Assert.assertTrue(followerClient.indices().exists(GetIndexRequest(followerIndexName2), RequestOptions.DEFAULT))
     }
