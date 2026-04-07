@@ -180,8 +180,10 @@ class StopReplicationIT: MultiClusterRestTestCase() {
 
     fun `test stop without replication in progress`() {
         val followerClient = getClientForCluster(FOLLOWER)
-        // Idempotent stop - should succeed even without active replication
-        followerClient.stopReplication("no_index")
+        assertThatThrownBy {
+            followerClient.stopReplication("no_index")
+        }.isInstanceOf(ResponseException::class.java)
+                .hasMessageContaining("No replication in progress for index:no_index")
     }
 
     fun `test stop replication when leader cluster is unavailable`() {
@@ -269,10 +271,10 @@ class StopReplicationIT: MultiClusterRestTestCase() {
         val deleteResponse = leaderClient.indices().delete(DeleteIndexRequest(leaderIndexName), RequestOptions.DEFAULT)
         assertThat(deleteResponse.isAcknowledged)
 
-        // After leader deletion, replication is stopped. The follower index is not auto-deleted
-        // because the stop action removes the persistent task from cluster state, so the task
-        // cleanup cannot verify it is the tracking task. Verify follower index still exists
-        // and other indexes are unaffected.
+        // After removing the !isAssigned filter, the stop action removes assigned tasks from
+        // cluster state. This means the task cleanup cannot verify itself via isTrackingTaskForIndex,
+        // so the follower index is no longer auto-deleted when the leader is deleted.
+        // Verify follower index still exists and other indexes are unaffected.
         assertBusy({
             assertThat(followerClient.indices().exists(GetIndexRequest(followerIndexName), RequestOptions.DEFAULT)).isTrue()
         }, 30, TimeUnit.SECONDS)
@@ -320,8 +322,10 @@ class StopReplicationIT: MultiClusterRestTestCase() {
         assertBusy {
             assertThat(leaderClient.indices().exists(GetIndexRequest("restored-$followerIndexName"), RequestOptions.DEFAULT)).isEqualTo(true)
         }
-        // Invoke stop on the new leader cluster index - idempotent, should succeed
-        leaderClient.stopReplication("restored-$followerIndexName")
+        // Stop on restored index - metadata document doesn't exist
+        assertThatThrownBy { leaderClient.stopReplication("restored-$followerIndexName") }
+                .isInstanceOf(ResponseException::class.java)
+                .hasMessageContaining("No replication in progress for index:restored-$followerIndexName")
         // Start replication on the new leader index
         followerClient.startReplication(
                 StartReplicationRequest("source", "restored-$followerIndexName", "restored-$followerIndexName"),
@@ -333,51 +337,5 @@ class StopReplicationIT: MultiClusterRestTestCase() {
             `validate status syncing response`(statusResp)
             assertThat(followerClient.getShardReplicationTasks("restored-$followerIndexName")).isNotEmpty()
         }, 60, TimeUnit.SECONDS)
-    }
-
-    fun `test idempotent stop replication can be called multiple times`() {
-        val followerClient = getClientForCluster(FOLLOWER)
-        val leaderClient = getClientForCluster(LEADER)
-        createConnectionBetweenClusters(FOLLOWER, LEADER)
-        val createIndexResponse = leaderClient.indices().create(CreateIndexRequest(leaderIndexName), RequestOptions.DEFAULT)
-        assertThat(createIndexResponse.isAcknowledged).isTrue()
-        followerClient.startReplication(
-            StartReplicationRequest("source", leaderIndexName, followerIndexName),
-            waitForRestore = true
-        )
-        // First stop should succeed
-        followerClient.stopReplication(followerIndexName)
-        // Second stop should also succeed (idempotent)
-        followerClient.stopReplication(followerIndexName)
-    }
-
-    fun `test stop replication cleans up and allows restart`() {
-        val followerClient = getClientForCluster(FOLLOWER)
-        val leaderClient = getClientForCluster(LEADER)
-        createConnectionBetweenClusters(FOLLOWER, LEADER)
-        val createIndexResponse = leaderClient.indices().create(CreateIndexRequest(leaderIndexName), RequestOptions.DEFAULT)
-        assertThat(createIndexResponse.isAcknowledged).isTrue()
-        followerClient.startReplication(
-            StartReplicationRequest("source", leaderIndexName, followerIndexName),
-            waitForRestore = true
-        )
-        val sourceMap = mapOf("name" to randomAlphaOfLength(5))
-        leaderClient.index(IndexRequest(leaderIndexName).id("1").source(sourceMap), RequestOptions.DEFAULT)
-        assertBusy {
-            assertThat(followerClient.indices().exists(GetIndexRequest(followerIndexName), RequestOptions.DEFAULT)).isTrue()
-        }
-        // Stop replication
-        followerClient.stopReplication(followerIndexName)
-        // Verify follower index is still accessible (unblocked) after stop
-        followerClient.index(IndexRequest(followerIndexName).id("2").source(sourceMap), RequestOptions.DEFAULT)
-        // Delete follower index and restart replication
-        followerClient.indices().delete(DeleteIndexRequest(followerIndexName), RequestOptions.DEFAULT)
-        followerClient.startReplication(
-            StartReplicationRequest("source", leaderIndexName, followerIndexName),
-            waitForRestore = true
-        )
-        assertBusy {
-            assertThat(followerClient.indices().exists(GetIndexRequest(followerIndexName), RequestOptions.DEFAULT)).isTrue()
-        }
     }
 }

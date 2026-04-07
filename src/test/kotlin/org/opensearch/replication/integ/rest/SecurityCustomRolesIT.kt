@@ -87,9 +87,12 @@ class SecurityCustomRolesIT: SecurityBase()  {
 
     fun `test for FOLLOWER that STOP replication works for user with valid permissions`() {
         val followerClient = getClientForCluster(FOLLOWER)
-        // Idempotent stop - should succeed even without active replication
-        followerClient.stopReplication("follower-index1",
-                requestOptions= RequestOptions.DEFAULT.addBasicAuthHeader("testUser1",INTEG_TEST_PASSWORD))
+
+        Assertions.assertThatThrownBy {
+            followerClient.stopReplication("follower-index1",
+                    requestOptions= RequestOptions.DEFAULT.addBasicAuthHeader("testUser1",INTEG_TEST_PASSWORD))
+        }.isInstanceOf(ResponseException::class.java)
+                .hasMessageContaining("No replication in progress for index:follower-index1")
     }
 
     fun `test for FOLLOWER that STOP replication is forbidden for user with invalid permissions`() {

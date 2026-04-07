@@ -1441,55 +1441,5 @@ class StartReplicationIT: MultiClusterRestTestCase() {
             }
         }
     }
-
-    fun `test start replication is blocked when replication is already running`() {
-        val followerClient = getClientForCluster(FOLLOWER)
-        val leaderClient = getClientForCluster(LEADER)
-        val followerIndexName = "follower_index_active_block"
-        createConnectionBetweenClusters(FOLLOWER, LEADER)
-        val createIndexResponse = leaderClient.indices().create(CreateIndexRequest(leaderIndexName), RequestOptions.DEFAULT)
-        assertThat(createIndexResponse.isAcknowledged).isTrue()
-        followerClient.startReplication(
-            StartReplicationRequest("source", leaderIndexName, followerIndexName),
-            waitForRestore = true
-        )
-        // Attempting to start replication again on the same follower index should fail
-        // because the index already exists and replication metadata is RUNNING
-        assertThatThrownBy {
-            followerClient.startReplication(
-                StartReplicationRequest("source", leaderIndexName, followerIndexName)
-            )
-        }.isInstanceOf(ResponseException::class.java)
-            .hasMessageContaining("Cant use same index again for replication")
-    }
-
-    fun `test start replication succeeds after stop cleans up`() {
-        val followerClient = getClientForCluster(FOLLOWER)
-        val leaderClient = getClientForCluster(LEADER)
-        val followerIndexName = "follower_index_restart"
-        createConnectionBetweenClusters(FOLLOWER, LEADER)
-        val createIndexResponse = leaderClient.indices().create(CreateIndexRequest(leaderIndexName), RequestOptions.DEFAULT)
-        assertThat(createIndexResponse.isAcknowledged).isTrue()
-        // Start replication
-        followerClient.startReplication(
-            StartReplicationRequest("source", leaderIndexName, followerIndexName),
-            waitForRestore = true
-        )
-        assertBusy {
-            assertThat(followerClient.indices().exists(GetIndexRequest(followerIndexName), RequestOptions.DEFAULT)).isTrue()
-        }
-        // Stop replication (cleans up metadata and stale tasks)
-        followerClient.stopReplication(followerIndexName)
-        // Delete the follower index so we can start fresh
-        followerClient.indices().delete(DeleteIndexRequest(followerIndexName), RequestOptions.DEFAULT)
-        // Start replication again - should succeed since stop cleaned everything up
-        followerClient.startReplication(
-            StartReplicationRequest("source", leaderIndexName, followerIndexName),
-            waitForRestore = true
-        )
-        assertBusy {
-            assertThat(followerClient.indices().exists(GetIndexRequest(followerIndexName), RequestOptions.DEFAULT)).isTrue()
-        }
-    }
 }
 
