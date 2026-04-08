@@ -118,6 +118,9 @@ class TransportReplicateIndexClusterManagerNodeAction @Inject constructor(transp
                     log.info("Cleaned up $staleTaskCount stale tasks for ${replicateIndexReq.followerIndex}")
                 }
 
+                // Validate no assigned tasks remain after cleanup
+                StaleTaskUtils.validateNoTasksRemaining(clusterService, replicateIndexReq.followerIndex)
+
                 if (state.routingTable.hasIndex(replicateIndexReq.followerIndex)) {
                     throw IllegalArgumentException("Cant use same index again for replication. " +
                     "Delete the index:${replicateIndexReq.followerIndex}")
@@ -165,11 +168,17 @@ class TransportReplicateIndexClusterManagerNodeAction @Inject constructor(transp
         if (replicationStateParams != null) {
             val currentState = replicationStateParams[REPLICATION_LAST_KNOWN_OVERALL_STATE]
 
-            if (currentState == ReplicationOverallState.RUNNING.name ||
-                currentState == ReplicationOverallState.PAUSED.name) {
+            if (currentState == ReplicationOverallState.RUNNING.name) {
                 throw IllegalStateException(
-                    "Replication is already active for index $indexName in $currentState state. " +
-                    "Cannot start replication again. Use resume API to restart paused replication."
+                    "Replication is already running for index $indexName. " +
+                    "Cannot start replication again."
+                )
+            }
+
+            if (currentState == ReplicationOverallState.PAUSED.name) {
+                throw IllegalStateException(
+                    "Replication is paused for index $indexName. " +
+                    "Use resume API to restart paused replication."
                 )
             }
 
