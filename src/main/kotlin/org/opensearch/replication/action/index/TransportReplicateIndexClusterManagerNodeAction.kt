@@ -121,11 +121,6 @@ class TransportReplicateIndexClusterManagerNodeAction @Inject constructor(transp
                 // Validate no assigned tasks remain after cleanup
                 StaleTaskUtils.validateNoTasksRemaining(clusterService, replicateIndexReq.followerIndex)
 
-                if (state.routingTable.hasIndex(replicateIndexReq.followerIndex)) {
-                    throw IllegalArgumentException("Cant use same index again for replication. " +
-                    "Delete the index:${replicateIndexReq.followerIndex}")
-                }
-
                 indexScopedSettings.validate(replicateIndexReq.settings,
                         false,
                         false)
