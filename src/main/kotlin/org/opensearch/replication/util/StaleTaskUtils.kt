@@ -62,7 +62,7 @@ object StaleTaskUtils {
             )
         }
     }
-    fun findStaleTasksForIndex(
+    private fun findStaleTasksForIndex(
         clusterService: ClusterService,
         indexName: String
     ): List<PersistentTasksCustomMetadata.PersistentTask<*>> {
