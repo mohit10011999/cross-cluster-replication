@@ -271,12 +271,9 @@ class StopReplicationIT: MultiClusterRestTestCase() {
         val deleteResponse = leaderClient.indices().delete(DeleteIndexRequest(leaderIndexName), RequestOptions.DEFAULT)
         assertThat(deleteResponse.isAcknowledged)
 
-        // After removing the !isAssigned filter, the stop action removes assigned tasks from
-        // cluster state. This means the task cleanup cannot verify itself via isTrackingTaskForIndex,
-        // so the follower index is no longer auto-deleted when the leader is deleted.
-        // Verify follower index still exists and other indexes are unaffected.
+        // Make sure follower index got deleted after it is deleted from the leader, and it didn't affect any other indexes
         assertBusy({
-            assertThat(followerClient.indices().exists(GetIndexRequest(followerIndexName), RequestOptions.DEFAULT)).isTrue()
+            Assert.assertFalse(followerClient.indices().exists(GetIndexRequest(followerIndexName), RequestOptions.DEFAULT))
         }, 30, TimeUnit.SECONDS)
         Assert.assertTrue(followerClient.indices().exists(GetIndexRequest(followerIndexName2), RequestOptions.DEFAULT))
     }

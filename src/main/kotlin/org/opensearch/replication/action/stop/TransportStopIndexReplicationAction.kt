@@ -14,6 +14,7 @@ package org.opensearch.replication.action.stop
 import org.opensearch.commons.replication.action.ReplicationActions.STOP_REPLICATION_ACTION_NAME
 import org.opensearch.commons.replication.action.StopIndexReplicationRequest
 import org.opensearch.replication.ReplicationPlugin.Companion.REPLICATED_INDEX_SETTING
+import org.opensearch.replication.ReplicationPlugin.Companion.REPLICATION_REPLICATE_INDEX_DELETION
 import org.opensearch.replication.action.index.block.IndexBlockUpdateType
 import org.opensearch.replication.action.index.block.UpdateIndexBlockAction
 import org.opensearch.replication.action.index.block.UpdateIndexBlockRequest
@@ -36,6 +37,8 @@ import org.opensearch.OpenSearchException
 import org.opensearch.ResourceNotFoundException
 import org.opensearch.core.action.ActionListener
 import org.opensearch.action.admin.indices.open.OpenIndexRequest
+import org.opensearch.action.admin.indices.delete.DeleteIndexAction
+import org.opensearch.action.admin.indices.delete.DeleteIndexRequest
 import org.opensearch.action.support.ActionFilters
 import org.opensearch.action.support.clustermanager.AcknowledgedResponse
 import org.opensearch.action.support.clustermanager.TransportClusterManagerNodeAction
@@ -120,11 +123,33 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
                     }
                 }
 
+                var leaderIndexDeleted = false
                 try {
                     val replMetadata = replicationMetadataManager.getIndexReplicationMetadata(request.indexName)
                     val remoteClient = client.getRemoteClusterClient(replMetadata.connectionName)
-                    val retentionLeaseHelper = RemoteClusterRetentionLeaseHelper(clusterService.clusterName.value(), clusterService.state().metadata.clusterUUID(), remoteClient)
-                    retentionLeaseHelper.attemptRemoveRetentionLease(clusterService, replMetadata, request.indexName)
+
+                    // Check if leader index still exists before attempting retention lease removal
+                    try {
+                        val leaderClusterClient = client.getRemoteClusterClient(replMetadata.connectionName)
+                        val clusterStateRequest = leaderClusterClient.admin().cluster().prepareState()
+                            .clear()
+                            .setIndices(replMetadata.leaderContext.resource)
+                            .setMetadata(true)
+                            .request()
+                        val leaderState = leaderClusterClient.suspending(
+                            leaderClusterClient.admin().cluster()::state)(clusterStateRequest).state
+                        if (leaderState.metadata.index(replMetadata.leaderContext.resource) == null) {
+                            leaderIndexDeleted = true
+                        }
+                    } catch (e: Exception) {
+                        log.info("Leader index ${replMetadata.leaderContext.resource} appears to be deleted: ${e.message}")
+                        leaderIndexDeleted = true
+                    }
+
+                    if (!leaderIndexDeleted) {
+                        val retentionLeaseHelper = RemoteClusterRetentionLeaseHelper(clusterService.clusterName.value(), clusterService.state().metadata.clusterUUID(), remoteClient)
+                        retentionLeaseHelper.attemptRemoveRetentionLease(clusterService, replMetadata, request.indexName)
+                    }
                 } catch(e: Exception) {
                     log.error("Failed to remove retention lease from the leader cluster", e)
                 }
@@ -152,6 +177,23 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
                 } catch (e: ResourceNotFoundException) {
                     throw IllegalArgumentException("No replication in progress for index:${request.indexName}")
                 }
+
+                // Delete follower index if leader index was deleted and the setting is enabled
+                if (leaderIndexDeleted
+                    && clusterService.clusterSettings.get(REPLICATION_REPLICATE_INDEX_DELETION)
+                    && clusterService.state().routingTable.hasIndex(request.indexName)) {
+                    try {
+                        log.info("Deleting follower index ${request.indexName} due to leader index deletion")
+                        val deleteResponse = client.suspendExecute(
+                            DeleteIndexAction.INSTANCE, DeleteIndexRequest(request.indexName), injectSecurityContext = true)
+                        if (!deleteResponse.isAcknowledged) {
+                            log.error("Failed to delete follower index ${request.indexName} after leader deletion")
+                        }
+                    } catch (e: Exception) {
+                        log.error("Failed to delete follower index ${request.indexName} after leader deletion", e)
+                    }
+                }
+
                 listener.onResponse(AcknowledgedResponse(true))
             } catch (e: Exception) {
                 log.error("Stop replication failed for index[${request.indexName}] with error ${e.stackTraceToString()}")
