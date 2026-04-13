@@ -23,6 +23,7 @@ import org.opensearch.replication.metadata.ReplicationMetadataManager
 import org.opensearch.replication.metadata.UpdateMetadataAction
 import org.opensearch.replication.metadata.UpdateMetadataRequest
 import org.opensearch.replication.seqno.RemoteClusterRetentionLeaseHelper
+import org.opensearch.replication.task.index.IndexReplicationParams
 import org.opensearch.replication.util.StaleTaskUtils
 import org.opensearch.replication.util.coroutineContext
 import org.opensearch.replication.util.suspendExecute
@@ -56,6 +57,7 @@ import org.opensearch.cluster.metadata.Metadata
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.inject.Inject
 import org.opensearch.core.common.io.stream.StreamInput
+import org.opensearch.core.index.shard.ShardId
 import org.opensearch.common.settings.Settings
 import org.opensearch.replication.util.stackTraceToString
 import org.opensearch.threadpool.ThreadPool
@@ -128,27 +130,31 @@ class TransportStopIndexReplicationAction @Inject constructor(transportService: 
                     val replMetadata = replicationMetadataManager.getIndexReplicationMetadata(request.indexName)
                     val remoteClient = client.getRemoteClusterClient(replMetadata.connectionName)
 
-                    // Check if leader index still exists before attempting retention lease removal
+                    // Single remote cluster state call to check leader existence and get metadata.
                     try {
-                        val leaderClusterClient = client.getRemoteClusterClient(replMetadata.connectionName)
-                        val clusterStateRequest = leaderClusterClient.admin().cluster().prepareState()
+                        val clusterStateRequest = remoteClient.admin().cluster().prepareState()
                             .clear()
                             .setIndices(replMetadata.leaderContext.resource)
                             .setMetadata(true)
                             .request()
-                        val leaderState = leaderClusterClient.suspending(
-                            leaderClusterClient.admin().cluster()::state)(clusterStateRequest).state
-                        if (leaderState.metadata.index(replMetadata.leaderContext.resource) == null) {
+                        val leaderState = remoteClient.suspending(
+                            remoteClient.admin().cluster()::state)(clusterStateRequest).state
+                        val leaderIndexMetadata = leaderState.metadata.index(replMetadata.leaderContext.resource)
+                        if (leaderIndexMetadata == null) {
                             leaderIndexDeleted = true
+                        } else {
+                            // Leader exists — remove retention leases using the metadata we already fetched
+                            val params = IndexReplicationParams(replMetadata.connectionName, leaderIndexMetadata.index, request.indexName)
+                            val shards = clusterService.state().routingTable.indicesRouting().get(params.followerIndexName)?.shards()
+                            val retentionLeaseHelper = RemoteClusterRetentionLeaseHelper(clusterService.clusterName.value(), clusterService.state().metadata.clusterUUID(), remoteClient)
+                            shards?.forEach {
+                                val followerShardId = it.value.shardId
+                                retentionLeaseHelper.attemptRetentionLeaseRemoval(ShardId(params.leaderIndex, followerShardId.id), followerShardId)
+                            }
                         }
                     } catch (e: Exception) {
                         log.info("Leader index ${replMetadata.leaderContext.resource} appears to be deleted: ${e.message}")
                         leaderIndexDeleted = true
-                    }
-
-                    if (!leaderIndexDeleted) {
-                        val retentionLeaseHelper = RemoteClusterRetentionLeaseHelper(clusterService.clusterName.value(), clusterService.state().metadata.clusterUUID(), remoteClient)
-                        retentionLeaseHelper.attemptRemoveRetentionLease(clusterService, replMetadata, request.indexName)
                     }
                 } catch(e: Exception) {
                     log.error("Failed to remove retention lease from the leader cluster", e)
