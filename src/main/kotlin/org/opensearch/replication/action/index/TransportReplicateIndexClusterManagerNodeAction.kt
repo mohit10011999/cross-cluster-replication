@@ -115,9 +115,6 @@ class TransportReplicateIndexClusterManagerNodeAction @Inject constructor(transp
                     log.info("Cleaned up $staleTaskCount stale tasks for ${replicateIndexReq.followerIndex}")
                 }
 
-                // Validate no assigned tasks remain after cleanup
-                StaleTaskUtils.validateNoTasksRemaining(clusterService, replicateIndexReq.followerIndex)
-
                 // Validate no active replication metadata exists before creating new tasks
                 validateNoActiveMetadata(replicateIndexReq.followerIndex)
 
