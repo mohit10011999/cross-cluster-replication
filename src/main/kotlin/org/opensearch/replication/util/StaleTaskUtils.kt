@@ -100,12 +100,16 @@ object StaleTaskUtils {
     }
 
     /**
-     * Removes stale replication tasks for the given index from the cluster state.
+     * Removes stale replication tasks for the given index from the cluster state
      * A task is removed only if it is truly stale:
-     * Unassigned tasks are always removed.
+     * Unassigned tasks are always removed
      * Assigned tasks are removed only if the assigned node is no longer in the cluster
-     * or the task is not actually running in the task manager on that node.
+     * or the task is not actually running in the task manager on that node
+     * If an assigned task is found to be actively running on a valid node, an
+     * IllegalStateException is thrown instructing the caller to run the Stop
+     * Replication API first
      * @return the number of tasks successfully removed
+     * @throws IllegalStateException if any active (non-stale) tasks are found
      */
     suspend fun removeStaleTasksForIndex(
         clusterService: ClusterService,
@@ -156,11 +160,19 @@ object StaleTaskUtils {
                 if (!isTaskRunningOnNode(task, runningDescriptions)) {
                     log.info("Task ${task.id} is assigned to node $nodeId but not running in task manager")
                     if (removeTask(client, task, indexName)) removed++
+                } else {
+                    // Task is actively running — cannot remove, user must stop replication first
+                    log.warn("Task ${task.id} is actively running on node $nodeId — cannot remove")
+                    throw IllegalStateException(
+                        "Replication task ${task.id} is actively running for index $indexName. " +
+                        "Please run the Stop Replication API first to stop active tasks before retrying."
+                    )
                 }
             }
         }
 
         log.info("Successfully cleaned up $removed stale task(s) for index $indexName")
+
         return removed
     }
 

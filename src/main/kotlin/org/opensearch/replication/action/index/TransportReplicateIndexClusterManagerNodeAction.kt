@@ -110,6 +110,7 @@ class TransportReplicateIndexClusterManagerNodeAction @Inject constructor(transp
                 }
 
                 // Check for and remove stale tasks before creating new ones
+                // Throws IllegalStateException if any active (non-stale) tasks are found.
                 val staleTaskCount = StaleTaskUtils.removeStaleTasksForIndex(clusterService, nodeClient, replicateIndexReq.followerIndex)
                 if (staleTaskCount > 0) {
                     log.info("Cleaned up $staleTaskCount stale tasks for ${replicateIndexReq.followerIndex}")

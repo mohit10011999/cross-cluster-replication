@@ -315,6 +315,29 @@ class StaleTaskUtilsTests : OpenSearchTestCase() {
         assertThat(client.removedTaskIds).hasSize(2)
     }
 
+    fun testRemoveStaleTasksForIndex_throwsWhenActiveTaskRunningOnValidNode() = runBlocking {
+        val tasks = PersistentTasksCustomMetadata.builder()
+        tasks.addTask<PersistentTaskParams>(
+            "replication:index:$followerIndex",
+            IndexReplicationExecutor.TASK_NAME,
+            IndexReplicationParams("remote", Index(followerIndex, "_na_"), followerIndex),
+            PersistentTasksCustomMetadata.Assignment("valid_node", "test")
+        )
+        // Node exists and ListTasks returns a matching description — task is running
+        setClusterStateWithTasksAndNodes(tasks.build(), listOf("valid_node"))
+
+        val runningDesc = setOf("replication:remote -> $followerIndex")
+        val client = StaleTaskTestClient("activeRunning", runningDescriptions = runningDesc)
+
+        assertThatThrownBy {
+            runBlocking {
+                StaleTaskUtils.removeStaleTasksForIndex(clusterService, client, followerIndex)
+            }
+        }.isInstanceOf(IllegalStateException::class.java)
+            .hasMessageContaining("Please run the Stop Replication API first")
+            .hasMessageContaining(followerIndex)
+    }
+
     //Helpers
 
     private fun buildPersistentTask(
@@ -386,7 +409,23 @@ class StaleTaskUtilsTests : OpenSearchTestCase() {
                     }
                 }
                 ListTasksAction.INSTANCE -> {
-                    val response = ListTasksResponse(emptyList(), emptyList(), emptyList())
+                    val taskInfos = runningDescriptions.map { desc ->
+                        org.opensearch.tasks.TaskInfo(
+                            org.opensearch.core.tasks.TaskId("valid_node", 1L),
+                            "transport",
+                            "cluster:indices/admin/replication",
+                            desc,
+                            null,  // status
+                            0L,    // startTime
+                            0L,    // runningTimeNanos
+                            true,  // cancellable
+                            false, // cancelled
+                            org.opensearch.core.tasks.TaskId.EMPTY_TASK_ID,
+                            mapOf(),
+                            null   // resourceStats
+                        )
+                    }
+                    val response = ListTasksResponse(taskInfos, emptyList(), emptyList())
                     listener.onResponse(response as Response)
                 }
                 else -> {
