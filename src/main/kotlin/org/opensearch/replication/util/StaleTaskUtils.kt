@@ -44,31 +44,6 @@ object StaleTaskUtils {
      */
     private val SHARD_TASK_PATTERN = Regex("^replication:\\[([^\\]]+)\\]\\[\\d+\\]$")
 
-    /**
-     * Validates that no replication tasks (assigned or unassigned) remain for the given index.
-     * Should be called after removeStaleTasksForIndex to ensure cleanup was complete.
-     * @throws IllegalStateException if any replication tasks still exist
-     */
-    fun validateNoTasksRemaining(
-        clusterService: ClusterService,
-        indexName: String
-    ) {
-        val allTasks = clusterService.state().metadata
-            .custom<PersistentTasksCustomMetadata>(PersistentTasksCustomMetadata.TYPE)
-            ?: return
-
-        val remainingTasks = allTasks.tasks().filter { task ->
-            isReplicationTaskForIndex(task, indexName)
-        }
-        if (remainingTasks.isNotEmpty()) {
-            log.warn("Found ${remainingTasks.size} active task(s) for index $indexName: ${remainingTasks.map { it.id }}")
-            throw IllegalStateException(
-                "Replication tasks are still active for index $indexName. " +
-                "Please run the Stop Replication API to clean up before retrying."
-            )
-        }
-    }
-
     //  Finds all replication tasks for the given index from the cluster state.
     private fun findReplicationTasksForIndex(
         clusterService: ClusterService,
