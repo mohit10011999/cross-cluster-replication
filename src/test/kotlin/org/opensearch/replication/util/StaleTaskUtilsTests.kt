@@ -244,7 +244,35 @@ class StaleTaskUtilsTests : OpenSearchTestCase() {
         assertThat(client.removedTaskIds).hasSize(2)
     }
 
-    fun testRemoveStaleTasksForIndex_throwsWhenActiveTaskRunningOnValidNode() = runBlocking {
+    // removeAllTasksForIndex
+
+    fun testRemoveAllTasksForIndex_returnsZeroWhenNoTasks() = runBlocking {
+        val metadata = Metadata.builder().build()
+        val newState = ClusterState.builder(clusterService.state()).metadata(metadata).build()
+        setState(clusterService, newState)
+
+        val client = StaleTaskTestClient("allNoTasks")
+        val removed = StaleTaskUtils.removeAllTasksForIndex(clusterService, client, followerIndex)
+        assertThat(removed).isEqualTo(0)
+    }
+
+    fun testRemoveAllTasksForIndex_removesUnassignedTask() = runBlocking {
+        val tasks = PersistentTasksCustomMetadata.builder()
+        tasks.addTask<PersistentTaskParams>(
+            "replication:index:$followerIndex",
+            IndexReplicationExecutor.TASK_NAME,
+            IndexReplicationParams("remote", Index(followerIndex, "_na_"), followerIndex),
+            PersistentTasksCustomMetadata.INITIAL_ASSIGNMENT
+        )
+        setClusterStateWithTasks(tasks.build())
+
+        val client = StaleTaskTestClient("allUnassigned")
+        val removed = StaleTaskUtils.removeAllTasksForIndex(clusterService, client, followerIndex)
+        assertThat(removed).isEqualTo(1)
+        assertThat(client.removedTaskIds).hasSize(1)
+    }
+
+    fun testRemoveAllTasksForIndex_removesAssignedRunningTask() = runBlocking {
         val tasks = PersistentTasksCustomMetadata.builder()
         tasks.addTask<PersistentTaskParams>(
             "replication:index:$followerIndex",
@@ -252,19 +280,74 @@ class StaleTaskUtilsTests : OpenSearchTestCase() {
             IndexReplicationParams("remote", Index(followerIndex, "_na_"), followerIndex),
             PersistentTasksCustomMetadata.Assignment("valid_node", "test")
         )
-        // Node exists and ListTasks returns a matching description — task is running
         setClusterStateWithTasksAndNodes(tasks.build(), listOf("valid_node"))
 
-        val runningDesc = setOf("replication:remote -> $followerIndex")
-        val client = StaleTaskTestClient("activeRunning", runningDescriptions = runningDesc)
+        val client = StaleTaskTestClient("allRunning")
+        val removed = StaleTaskUtils.removeAllTasksForIndex(clusterService, client, followerIndex)
+        assertThat(removed).isEqualTo(1)
+        assertThat(client.removedTaskIds).hasSize(1)
+    }
 
-        assertThatThrownBy {
-            runBlocking {
-                StaleTaskUtils.removeStaleTasksForIndex(clusterService, client, followerIndex)
-            }
-        }.isInstanceOf(IllegalStateException::class.java)
-            .hasMessageContaining("Please run the Stop Replication API first")
-            .hasMessageContaining(followerIndex)
+    fun testRemoveAllTasksForIndex_removesMixedTasks() = runBlocking {
+        val tasks = PersistentTasksCustomMetadata.builder()
+        // Unassigned index task
+        tasks.addTask<PersistentTaskParams>(
+            "replication:index:$followerIndex",
+            IndexReplicationExecutor.TASK_NAME,
+            IndexReplicationParams("remote", Index(followerIndex, "_na_"), followerIndex),
+            PersistentTasksCustomMetadata.INITIAL_ASSIGNMENT
+        )
+        // Assigned shard task on valid node
+        val shardId = ShardId(Index(followerIndex, "_na_"), 0)
+        tasks.addTask<PersistentTaskParams>(
+            "replication:[$followerIndex][0]",
+            ShardReplicationExecutor.TASK_NAME,
+            ShardReplicationParams("remote", shardId, shardId),
+            PersistentTasksCustomMetadata.Assignment("valid_node", "test")
+        )
+        // Task for a different index — should not be touched
+        tasks.addTask<PersistentTaskParams>(
+            "replication:index:$otherIndex",
+            IndexReplicationExecutor.TASK_NAME,
+            IndexReplicationParams("remote", Index(otherIndex, "_na_"), otherIndex),
+            PersistentTasksCustomMetadata.INITIAL_ASSIGNMENT
+        )
+        setClusterStateWithTasksAndNodes(tasks.build(), listOf("valid_node"))
+
+        val client = StaleTaskTestClient("allMixed")
+        val removed = StaleTaskUtils.removeAllTasksForIndex(clusterService, client, followerIndex)
+        assertThat(removed).isEqualTo(2)
+        assertThat(client.removedTaskIds).hasSize(2)
+    }
+
+    fun testRemoveAllTasksForIndex_handlesRemovalFailure() = runBlocking {
+        val tasks = PersistentTasksCustomMetadata.builder()
+        tasks.addTask<PersistentTaskParams>(
+            "replication:index:$followerIndex",
+            IndexReplicationExecutor.TASK_NAME,
+            IndexReplicationParams("remote", Index(followerIndex, "_na_"), followerIndex),
+            PersistentTasksCustomMetadata.INITIAL_ASSIGNMENT
+        )
+        setClusterStateWithTasks(tasks.build())
+
+        val client = StaleTaskTestClient("allFail", removeThrows = RuntimeException("something broke"))
+        val removed = StaleTaskUtils.removeAllTasksForIndex(clusterService, client, followerIndex)
+        assertThat(removed).isEqualTo(0)
+    }
+
+    fun testRemoveAllTasksForIndex_handlesResourceNotFoundIdempotently() = runBlocking {
+        val tasks = PersistentTasksCustomMetadata.builder()
+        tasks.addTask<PersistentTaskParams>(
+            "replication:index:$followerIndex",
+            IndexReplicationExecutor.TASK_NAME,
+            IndexReplicationParams("remote", Index(followerIndex, "_na_"), followerIndex),
+            PersistentTasksCustomMetadata.INITIAL_ASSIGNMENT
+        )
+        setClusterStateWithTasks(tasks.build())
+
+        val client = StaleTaskTestClient("allAlreadyGone", removeThrows = ResourceNotFoundException("already gone"))
+        val removed = StaleTaskUtils.removeAllTasksForIndex(clusterService, client, followerIndex)
+        assertThat(removed).isEqualTo(1)
     }
 
     //Helpers
@@ -338,23 +421,7 @@ class StaleTaskUtilsTests : OpenSearchTestCase() {
                     }
                 }
                 ListTasksAction.INSTANCE -> {
-                    val taskInfos = runningDescriptions.map { desc ->
-                        org.opensearch.tasks.TaskInfo(
-                            org.opensearch.core.tasks.TaskId("valid_node", 1L),
-                            "transport",
-                            "cluster:indices/admin/replication",
-                            desc,
-                            null,  // status
-                            0L,    // startTime
-                            0L,    // runningTimeNanos
-                            true,  // cancellable
-                            false, // cancelled
-                            org.opensearch.core.tasks.TaskId.EMPTY_TASK_ID,
-                            mapOf(),
-                            null   // resourceStats
-                        )
-                    }
-                    val response = ListTasksResponse(taskInfos, emptyList(), emptyList())
+                    val response = ListTasksResponse(emptyList(), emptyList(), emptyList())
                     listener.onResponse(response as Response)
                 }
                 else -> {
