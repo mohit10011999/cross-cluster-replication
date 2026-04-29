@@ -86,10 +86,7 @@ class TransportResumeIndexReplicationAction @Inject constructor(transportService
                 validateResumeReplicationRequest(request)
 
                 // Check for and remove stale tasks before resuming
-                val staleTaskCount = StaleTaskUtils.removeStaleTasksForIndex(clusterService, client, request.indexName)
-                if (staleTaskCount > 0) {
-                    log.info("Cleaned up $staleTaskCount stale tasks for ${request.indexName}")
-                }
+                StaleTaskUtils.removeStaleTasksForIndex(clusterService, client, request.indexName)
 
                 val replMetdata = replicationMetadataManager.getIndexReplicationMetadata(request.indexName)
                 val remoteMetadata = getLeaderIndexMetadata(replMetdata.connectionName, replMetdata.leaderContext.resource)

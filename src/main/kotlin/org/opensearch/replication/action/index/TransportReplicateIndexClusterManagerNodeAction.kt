@@ -13,8 +13,6 @@ package org.opensearch.replication.action.index
 
 import org.opensearch.replication.metadata.ReplicationMetadataManager
 import org.opensearch.replication.metadata.ReplicationOverallState
-import org.opensearch.replication.metadata.state.REPLICATION_LAST_KNOWN_OVERALL_STATE
-import org.opensearch.replication.metadata.state.getReplicationStateParamsForIndex
 import org.opensearch.replication.task.ReplicationState
 import org.opensearch.replication.task.index.IndexReplicationExecutor
 import org.opensearch.replication.task.index.IndexReplicationParams
@@ -115,9 +113,6 @@ class TransportReplicateIndexClusterManagerNodeAction @Inject constructor(transp
                     log.info("Cleaned up $removedTaskCount tasks for ${replicateIndexReq.followerIndex}")
                 }
 
-                // Validate no active replication metadata exists before creating new tasks
-                validateNoActiveMetadata(replicateIndexReq.followerIndex)
-
                 indexScopedSettings.validate(replicateIndexReq.settings,
                         false,
                         false)
@@ -152,34 +147,6 @@ class TransportReplicateIndexClusterManagerNodeAction @Inject constructor(transp
                 log.error("Failed to trigger replication for ${replicateIndexReq.followerIndex} - ${e.stackTraceToString()}")
                 listener.onFailure(e)
             }
-        }
-    }
-
-    private suspend fun validateNoActiveMetadata(indexName: String) {
-        val replicationStateParams = getReplicationStateParamsForIndex(clusterService, indexName)
-
-        if (replicationStateParams != null) {
-            val currentState = replicationStateParams[REPLICATION_LAST_KNOWN_OVERALL_STATE]
-
-            if (currentState == ReplicationOverallState.RUNNING.name) {
-                throw IllegalStateException(
-                    "Replication is already running for index $indexName. " +
-                    "Cannot start replication again."
-                )
-            }
-
-            if (currentState == ReplicationOverallState.PAUSED.name) {
-                throw IllegalStateException(
-                    "Replication is paused for index $indexName. " +
-                    "Use resume API to restart paused replication."
-                )
-            }
-
-            // STOPPED or FAILED state indicates stale metadata
-            throw IllegalStateException(
-                "Stale replication metadata exists for index $indexName. " +
-                "Please run the Stop Replication API to clean up before starting replication."
-            )
         }
     }
 
