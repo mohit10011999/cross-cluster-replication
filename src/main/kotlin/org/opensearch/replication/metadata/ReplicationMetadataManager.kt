@@ -56,16 +56,17 @@ open class ReplicationMetadataManager constructor(private val clusterService: Cl
                 ReplicationContext(followerIndex, user?.overrideFgacRole(follower_cluster_role)),
                 ReplicationContext(leaderIndex, user?.overrideFgacRole(leader_cluster_role)), settings)
         addMetadata(AddReplicationMetadataRequest(replicationMetadata))
-        updateReplicationState(followerIndex, overallState)
+        updateReplicationState(followerIndex, overallState, connectionName)
     }
 
     suspend fun addAutofollowMetadata(patternName: String, connectionName: String, pattern: String,
                                       overallState: ReplicationOverallState, user: User?,
-                                      follower_cluster_role: String?, leader_cluster_role: String?, settings: Settings) {
+                                      follower_cluster_role: String?, leader_cluster_role: String?, settings: Settings,
+                                      followerIndexPattern: String? = null) {
         val replicationMetadata = ReplicationMetadata(connectionName,
                 ReplicationStoreMetadataType.AUTO_FOLLOW.name, overallState.name, CUSTOMER_INITIATED_ACTION,
                 ReplicationContext(patternName, user?.overrideFgacRole(follower_cluster_role)),
-                ReplicationContext(pattern, user?.overrideFgacRole(leader_cluster_role)), settings)
+                ReplicationContext(pattern, user?.overrideFgacRole(leader_cluster_role)), settings, followerIndexPattern)
         addMetadata(AddReplicationMetadataRequest(replicationMetadata))
     }
 
@@ -129,6 +130,19 @@ open class ReplicationMetadataManager constructor(private val clusterService: Cl
         updateReplicationState(followerIndex, ReplicationOverallState.STOPPED)
     }
 
+    /**
+     * Deletes replication metadata for multiple indices in ONE Bulk call.
+     * Returns set of indices that were successfully deleted.
+     * Note: updateReplicationState(STOPPED) is called per-index since it's a cluster state update.
+     */
+    suspend fun deleteIndexReplicationMetadata(followerIndices: List<String>): Set<String> {
+        val deleted = replicaionMetadataStore.deleteMetadata(ReplicationStoreMetadataType.INDEX.name, followerIndices)
+        for (index in deleted) {
+            try { updateReplicationState(index, ReplicationOverallState.STOPPED) } catch (_: Exception) {}
+        }
+        return deleted
+    }
+
     suspend fun deleteAutofollowMetadata(patternName: String,
                                          connectionName: String) {
         val delReq = DeleteReplicationMetadataRequest(ReplicationStoreMetadataType.AUTO_FOLLOW.name, connectionName, patternName)
@@ -153,6 +167,14 @@ open class ReplicationMetadataManager constructor(private val clusterService: Cl
         return executeAndWrapExceptionIfAny({
             replicaionMetadataStore.getMetadata(getReq, fetch_from_primary).replicationMetadata
         }, log, "Failed to fetch replication metadata") as ReplicationMetadata
+    }
+
+    /**
+     * Fetches replication metadata for multiple follower indices in ONE call for bulk API
+     * Returns a map of follower index name -> ReplicationMetadata. Missing indices are omitted.
+     */
+    suspend fun getIndexReplicationMetadata(followerIndices: List<String>): Map<String, ReplicationMetadata> {
+        return replicaionMetadataStore.getMetadata(ReplicationStoreMetadataType.INDEX.name, followerIndices)
     }
 
     fun getIndexReplicationMetadata(followerIndex: String,
@@ -180,9 +202,10 @@ open class ReplicationMetadataManager constructor(private val clusterService: Cl
         }, log, "Failed to fetch replication metadata") as ReplicationMetadata
     }
 
-    private suspend fun updateReplicationState(indexName: String, overallState: ReplicationOverallState) {
+    private suspend fun updateReplicationState(indexName: String, overallState: ReplicationOverallState, connectionName: String? = null) {
         val replicationStateParamMap = HashMap<String, String>()
         replicationStateParamMap[REPLICATION_LAST_KNOWN_OVERALL_STATE] = overallState.name
+        if (connectionName != null) replicationStateParamMap["connection_name"] = connectionName
         var updateType = UpdateReplicationStateDetailsRequest.UpdateType.ADD
         if(overallState == ReplicationOverallState.STOPPED) {
             updateType = UpdateReplicationStateDetailsRequest.UpdateType.REMOVE
